@@ -53,6 +53,8 @@ type EducationItem = {
 type ResumeDraft = {
   summary: string
   skills: string[]
+  // Optional display lines for grouped skills like "Frontend: React, Vue"
+  skillDisplayLines?: string[]
   workHistory: WorkHistoryItem[]
   education: EducationItem[]
   coverLetter: string
@@ -326,31 +328,83 @@ export default function ResumeBuilder() {
             {
               role: 'system',
               content:
-                'You are an expert resume writer. Return ONLY valid JSON with keys: summary, skills, workHistory (with id + bullets array), education (with id), coverLetter. No markdown, no code fences.',
+                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, claimedSkillsByCategory, suggestedSkillsByCategory, claimedSkills, workHistory (array of { id, bullets }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
             },
             {
               role: 'user',
-              content: `Generate a high-impact, ATS-optimized resume from this JSON. Keep workHistory IDs intact: ${JSON.stringify(
+              content: `Using the following candidate payload and job description, generate a human-written, technically credible JSON resume. Keep workHistory IDs intact: ${JSON.stringify(
                 payload,
               )}
 
-Requirements:
-- Summary: powerful, concise, executive tone; 4-6 sentences; each sentence should be rich and specific, including quantified impact, leadership scope, business outcomes, and industry keywords aligned to the job description. Mention total years of experience using payload.careerStartYear and payload.careerEndYear (e.g., “X+ years”).
-- Skills: prioritize ATS keywords from the job description (notes); keep to 12-24 items, no fluff.
-- WorkHistory: for EACH company, produce exactly 8 bullets.
-- Each bullet MUST be 35+ words (count words by whitespace). Do not return any bullet under 35 words.
-- Before returning JSON, self-verify every bullet word count. If any bullet is under 35 words, rewrite it until it meets the requirement.
-- Bullets must be action-oriented, achievement-driven, keyword-rich, and tailored to the job description.
-- Bullets must align strongly with the job description (near 100% match), but also include a few transferable skills not explicitly listed in the JD to keep the resume reusable.
-- Bullets should explicitly mention relevant tools/skills (e.g., React, Angular, Vue, TypeScript, AWS, Azure, CI/CD and others) where reasonable and consistent with the timeline.
-- Do NOT include company names or date ranges inside bullets. Keep bullets focused on actions, impact, and skills only.
-- Bullet content must respect the company period (start/end). Do NOT mention technologies that did not exist in that timeframe. Use plausible tech stacks for the era.
-- Timeline guidance: choose technologies that realistically fit the company’s time period; avoid introducing tools that were not common at the time.
-- Bullets must sound natural and human, not robotic.
-- If dates are missing or ambiguous, use conservative, widely adopted technologies for that time period.
-- CoverLetter: write a compelling, modern, and personable letter that feels tailored and confident, not generic. Emphasize value, outcomes, and alignment with the role. Avoid clichés and filler. Do NOT mention the company name. Use the candidate's real name from the profile (no placeholders like [Your Name]). End with a confident, warm call-to-action for an interview.
+INSTRUCTIONS:
+1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
+2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
+3. Do not summarize or paraphrase the job description before processing.
+4. Scan the full job description line-by-line and extract as many keywords and key tech stacks as possible, capturing them exactly as written.
+5. Collect keywords from the job title, responsibilities, required qualifications, preferred qualifications, nice-to-have sections, and any architecture, scale, or platform descriptions embedded in the text.
+6. Classify every extracted keyword into logical categories based on what the job description actually mentions (e.g. languages, frameworks, databases, cloud, DevOps, testing, methodologies, etc.). Use categories that match the job domain.
+7. Do not normalize, replace, or infer technologies during extraction.
+8. All keywords must initially remain literal to the job description wording.
+9. Assign a priority to each keyword:
+   a. P1 (Critical): appears in the job title, required section, or multiple times
+   b. P2 (Important): appears once or in preferred sections
+   c. P3 (Supporting): implied by responsibilities or architectural language
+10. The original job-description wording is mandatory and must never be replaced.
+11. Do not substitute one technology for another.
+12. Do not generalize platforms.
+13. Directly inject extracted job-description keywords and tech stacks into the resume.
+14. Maximize keyword coverage while maintaining logical consistency with the original resume.
+15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure.
+16. Never invent new roles, companies, job titles, or project domains.
+17. Generate a target title that closely mirrors the job description title and aligns with the candidate's career progression.
+18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. It must include the exact total years of full-time professional experience computed from payload.careerStartYear and payload.careerEndYear (for example: "10 years"). Do not round up; if dates are missing or ambiguous, state "Years of experience: unknown" and add a brief factual explanation in the 'notes' field.
+19. The summary must reference relevant scale, performance, architecture, and business impact using keywords from the job description.
+20. The summary must not include company names or personal pronouns.
+21. Use past tense for previous roles and present tense only for the current role.
+22. Each role must contain 5-7 bullets.
+23. Each bullet must be one sentence only. No paragraphs.
+24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
+25. Only 2-3 bullets per role may include measurable impact (percentage improvements, scale, performance, cost, or time saved).
+27. The Skills section must be grouped into categories that match the job description's technology domains. Only include skills that are relevant to the job or present in the original resume.
+28. Each skills category should include at least 3 skills.
+29. All job-description technologies must appear in both Skills and Experience sections.
+30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
+31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
+32. Provide a job match score between 95 and 99 based on how well the tailored resume aligns with the job requirements.
 
-Return ONLY JSON (no markdown).`,
+Additional rules (apply exactly):
+
+- Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
+
+- Required top-level keys: summary (string), targetTitle (string), claimedSkillsByCategory (object), suggestedSkillsByCategory (object), claimedSkills (array), workHistory (array of { id, bullets: string[] }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
+
+- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
+
+- Bullets (strict):
+  - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
+  - Each role must contain 5-7 bullets.
+  - Bullets must be action-oriented, concrete, mention technologies when relevant, and align with the provided job description (payload.notes).
+  - Follow the structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
+  - Do NOT include company names or date ranges inside bullets.
+  - Only 2-3 bullets per role may include explicit measurable impact.
+  - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
+
+- Skills:
+  - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
+  - suggestedSkillsByCategory may list reasonable, plausible extensions (0–8 items) but clearly avoid repeating claimed skills.
+  - All job-description technologies (P1/P2) must appear in both Skills and Experience sections.
+
+- Honesty & scope:
+  - Do NOT fabricate roles, responsibilities, metrics, ownership, or seniority beyond what the payload supports.
+  - Infer seniority conservatively from title and timeline; produce role-appropriate technical depth only when plausible.
+  - Cross-check each technology against the role's dates; only claim production use of a technology if it was widely available during the role and the payload includes supporting evidence. Otherwise describe exposure conservatively (e.g., evaluated, prototyped, supported) and record the limitation in the 'notes' field.
+
+- Formatting & validation:
+  - Ensure the returned JSON parses cleanly.
+  - Validate that every bullet meets the 25-word minimum, each role has 5-7 bullets, bullets are single-sentence and unique, and that required P1/P2 keywords are present in logical contexts.
+  - If any rule cannot be satisfied, still return JSON but set 'notes' to a short factual explanation of the limitation and include the jobMatchScore reflecting the constraint.
+
+If you understand, return the single JSON object now.`,
             },
           ],
         }),
@@ -370,19 +424,204 @@ Return ONLY JSON (no markdown).`,
         .trim()
       const parsed = JSON.parse(sanitizedContent)
 
-      updateDraft((prev) => ({
-        ...prev,
-        summary: parsed.summary ?? prev.summary,
-        skills: Array.isArray(parsed.skills) ? parsed.skills : prev.skills,
-        coverLetter: parsed.coverLetter ?? prev.coverLetter,
-        workHistory: prev.workHistory.map((item) => {
+      // helper to build display lines from categorized objects
+      // merges claimed and suggested categories into lines like:
+      // Category: claimed1, claimed2; suggested: suggested1, suggested2
+      const buildDisplayLinesFromCategories = (
+        claimed: Record<string, string[]> = {},
+        suggested: Record<string, string[]> = {},
+      ) =>
+        Object.keys({ ...claimed, ...suggested })
+          .filter((k) => ((claimed[k] ?? []).length > 0) || ((suggested[k] ?? []).length > 0))
+          .map((k) => {
+            const claimedItems = (claimed[k] ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
+            const suggestedItems = (suggested[k] ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
+            // merge claimed and suggested items, claimed first, deduplicated preserving order
+            const seen = new Set<string>()
+            const merged: string[] = []
+            for (const it of [...claimedItems, ...suggestedItems]) {
+              const key = it.toLowerCase()
+              if (!seen.has(key)) {
+                seen.add(key)
+                merged.push(it)
+              }
+            }
+            return `${k}: ${merged.join(', ')}`
+          })
+
+      updateDraft((prev) => {
+        // determine flattened claimed skills and optional display lines
+        let flatSkills: string[] | undefined = undefined
+        let skillDisplayLines: string[] | undefined = undefined
+
+        if (parsed.claimedSkillsByCategory && typeof parsed.claimedSkillsByCategory === 'object') {
+          // prefer categorized response
+          const cat = parsed.claimedSkillsByCategory as Record<string, string[]>
+          const suggestedCat = parsed.suggestedSkillsByCategory && typeof parsed.suggestedSkillsByCategory === 'object'
+            ? (parsed.suggestedSkillsByCategory as Record<string, string[]>)
+            : {}
+          flatSkills = Array.from(new Set((Object.values(cat) ?? []).flat().map((s) => (s ?? '').trim()).filter(Boolean)))
+          skillDisplayLines = buildDisplayLinesFromCategories(cat, suggestedCat)
+        } else if (Array.isArray(parsed.claimedSkills)) {
+          // fallback: model returned flat claimedSkills
+          flatSkills = parsed.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+        } else if (Array.isArray(parsed.skills)) {
+          // legacy fallback
+          flatSkills = parsed.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+        }
+
+        // if we didn't get categorized claimed skills but have suggested categories, show them
+        if (!skillDisplayLines && parsed.suggestedSkillsByCategory && typeof parsed.suggestedSkillsByCategory === 'object') {
+          const suggestedOnly = parsed.suggestedSkillsByCategory as Record<string, string[]>
+          skillDisplayLines = buildDisplayLinesFromCategories({}, suggestedOnly)
+        }
+
+        // helper to sanitize text returned from the model
+        const sanitizeText = (s: string) =>
+          (s ?? '')
+            .replace(/`+/g, '') // strip inline/backtick code markers
+            .replace(/^\s+|\s+$/g, '')
+            .replace(/\s+/g, ' ')
+
+        // helper: infer seniority from title
+        const inferSeniority = (title?: string) => {
+          if (!title) return 'mid'
+          const t = title.toLowerCase()
+          if (/\b(intern|internship|junior|jr\.)\b/.test(t)) return 'junior'
+          if (/\b(senior|sr\.|lead|principal|manager|director|vp|head|staff)\b/.test(t)) return 'senior'
+          return 'mid'
+        }
+
+        // helper: desired bullet count range by seniority
+        const targetRangeFor = (seniority: string) => {
+          switch (seniority) {
+            case 'junior':
+              return [3, 5]
+            case 'senior':
+              return [5, 7]
+            default:
+              return [4, 6]
+          }
+        }
+
+        // helper: split a long bullet into sentence-like parts to create more bullets
+        const splitIntoFragments = (text: string) =>
+          (text ?? '')
+            .split(/(?<=[.!?;])\s+/)
+            .map((s) => s.replace(/[\s\n]+/g, ' ').trim())
+            .filter(Boolean)
+
+        // helper: expand or trim bullets to match desired counts without inventing new claims
+        const normalizeCount = (bullets: string[], title?: string) => {
+          const seniority = inferSeniority(title)
+          const [minCount, maxCount] = targetRangeFor(seniority)
+
+          // sanitize bullets
+          const sanitized = bullets.map((b) => sanitizeText(b)).filter(Boolean)
+
+          // if already within range, return as-is (or trim to max)
+          if (sanitized.length >= minCount && sanitized.length <= maxCount) return sanitized.slice(0, maxCount)
+
+          // if too many, trim to max
+          if (sanitized.length > maxCount) return sanitized.slice(0, maxCount)
+
+          // if too few, try to split long bullets into sentence fragments
+          const expanded: string[] = []
+          for (const b of sanitized) {
+            const parts = splitIntoFragments(b)
+            if (parts.length > 1) {
+              for (const p of parts) {
+                if (expanded.length < maxCount) expanded.push(p)
+              }
+            } else {
+              expanded.push(b)
+            }
+            if (expanded.length >= minCount) break
+          }
+
+          // if still short, try secondary split on ' and ' (conservative)
+          if (expanded.length < minCount) {
+            for (const b of sanitized) {
+              const parts = b.split(/\s+and\s+/i).map((s) => s.trim()).filter(Boolean)
+              if (parts.length > 1) {
+                for (const p of parts) {
+                  if (!expanded.includes(p) && expanded.length < maxCount) expanded.push(p)
+                }
+              }
+              if (expanded.length >= minCount) break
+            }
+          }
+
+          // final fallback: repeat existing bullets with conservative, non-fabricated prefix to reach minCount
+          let idx = 0
+          while (expanded.length < minCount && sanitized.length > 0) {
+            const candidate = sanitized[idx % sanitized.length]
+            const variation = candidate.startsWith('Contributed') || candidate.startsWith('Supported') ? candidate : `Contributed to ${candidate.charAt(0).toLowerCase()}${candidate.slice(1)}`
+            if (!expanded.includes(variation)) expanded.push(variation)
+            idx += 1
+            if (idx > sanitized.length * 3) break
+          }
+
+          return expanded.slice(0, maxCount)
+        }
+
+        // deduplicate and normalize bullets for each company
+        // use a globalSeen set to avoid repeating semantically identical bullets across companies
+        const normalize = (s: string) => sanitizeText(s).toLowerCase()
+
+        const globalSeen = new Set<string>()
+
+        const workHistory = prev.workHistory.map((item) => {
           const next = parsed.workHistory?.find((entry: { id: string }) => entry.id === item.id)
+          const incoming = Array.isArray(next?.bullets) && next.bullets.length > 0 ? next.bullets : item.bullets
+          const localSeen = new Set<string>()
+          const deduped: string[] = []
+
+          for (const raw of incoming.map((b: string) => (b ?? '').trim()).filter(Boolean)) {
+            const b = sanitizeText(raw)
+            const key = normalize(b)
+
+            if (localSeen.has(key) || globalSeen.has(key)) {
+              // attempt a light role-based variation if possible (do not invent companies)
+              if (item.title) {
+                // only add role prefix if the bullet doesn't already appear role-prefixed
+                if (!/^as a\s+/i.test(b)) {
+                  const rolePrefix = `As a ${item.title}, `
+                  const modified = rolePrefix + b.charAt(0).toLowerCase() + b.slice(1)
+                  const modKey = normalize(modified)
+                  if (!localSeen.has(modKey) && !globalSeen.has(modKey)) {
+                    localSeen.add(modKey)
+                    globalSeen.add(modKey)
+                    deduped.push(modified)
+                    continue
+                  }
+                }
+              }
+              // skip duplicate if no safe variation can be produced
+              continue
+            }
+
+            localSeen.add(key)
+            globalSeen.add(key)
+            deduped.push(b)
+          }
+
+          const finalBullets = normalizeCount(deduped.length > 0 ? deduped : item.bullets, item.title)
           return {
             ...item,
-            bullets: Array.isArray(next?.bullets) && next.bullets.length > 0 ? next.bullets : item.bullets,
+            bullets: finalBullets,
           }
-        }),
-      }))
+        })
+
+        return {
+          ...prev,
+          summary: parsed.summary ? sanitizeText(parsed.summary) : prev.summary,
+            skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
+            skillDisplayLines,
+            coverLetter: parsed.coverLetter ? sanitizeText(parsed.coverLetter) : prev.coverLetter,
+          workHistory,
+        }
+      })
       setHasGenerated(true)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
@@ -460,25 +699,89 @@ Return ONLY JSON (no markdown).`,
     const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
-    const keywordList = Array.from(
-      new Set(draft.skills.map((skill) => skill.trim()).filter(Boolean)),
-    )
+    // Prepare skills for display in DOCX.
+    // If skills are provided in "Category: item" form, group them by category
+    // and render as "Category: item1, item2". Keep uncategorized skills as-is.
+    let displaySkills: string[]
+    let flatKeywords: string[]
+    if (Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0) {
+      // model returned categorized display lines
+      displaySkills = draft.skillDisplayLines
+      // build flat keywords from those lines (category: item1, item2 -> items)
+      flatKeywords = draft.skillDisplayLines
+        .map((line) => line.split(':').slice(1).join(':'))
+        .map((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
+        .flat()
+    } else {
+      const rawSkills = draft.skills.map((s) => s.trim()).filter(Boolean)
+      const categoryMap: Record<string, string[]> = {}
+      const uncategorized: string[] = []
+      for (const s of rawSkills) {
+        const parts = s.split(':').map((p) => p.trim()).filter(Boolean)
+        if (parts.length >= 2) {
+          const category = parts[0]
+          const item = parts.slice(1).join(':')
+          categoryMap[category] = categoryMap[category] ?? []
+          if (!categoryMap[category].includes(item)) categoryMap[category].push(item)
+        } else {
+          if (!uncategorized.includes(s)) uncategorized.push(s)
+        }
+      }
+      displaySkills = [
+        ...Object.keys(categoryMap).map((cat) => `${cat}: ${categoryMap[cat].join(', ')}`),
+        ...uncategorized,
+      ]
+
+      // Keywords used for highlighting should include both raw skills and grouped items
+      flatKeywords = Array.from(new Set(rawSkills.concat(...Object.values(categoryMap))))
+    }
+
+    // Expand keyword list to maximize highlighting in bullets:
+    // - include flatKeywords (from skills and grouped items)
+    // - also include component tokens from multi-word phrases (e.g., 'AWS Lambda' -> 'AWS', 'Lambda')
+    // - deduplicate and sort by length desc so longer phrases match before shorter tokens
+    const extraTokens = flatKeywords
+      .map((k) => k.split(/[\s,/\-()]+/).map((t) => t.trim()).filter(Boolean))
+      .flat()
+    const keywordSet = new Set<string>([...flatKeywords.map((k) => k.trim()).filter(Boolean), ...extraTokens.map((k) => k.trim()).filter(Boolean)])
+    const keywordList = Array.from(keywordSet).filter(Boolean).sort((a, b) => b.length - a.length)
     const experienceRightIndent = 360
     const rightTabStop = 10080 - experienceRightIndent
     const fontFamily = 'Arial'
     const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const buildHighlightedRuns = (text: string, size = 21) => {
+      const buildHighlightedRuns = (text: string, size = 21) => {
       if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       if (keywordList.length === 0) {
         return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       }
-      const pattern = new RegExp(`(${keywordList.map(escapeRegExp).join('|')})`, 'gi')
-      return text.split(pattern).filter((chunk) => chunk.length > 0).map((chunk) => {
-        const isMatch = keywordList.some(
-          (keyword) => keyword.toLowerCase() === chunk.toLowerCase(),
-        )
-        return new TextRun({ text: chunk, bold: isMatch, size, color: '111111', font: fontFamily })
-      })
+      // match whole words only to avoid highlighting substrings (e.g., 'git' inside 'digital')
+      const pattern = new RegExp(`\\b(${keywordList.map(escapeRegExp).join('|')})\\b`, 'gi')
+      return text
+        .split(pattern)
+        .filter((chunk) => chunk.length > 0)
+        .map((chunk) => {
+          const isMatch = keywordList.some(
+            (keyword) => keyword.toLowerCase() === chunk.toLowerCase(),
+          )
+          return new TextRun({ text: chunk, bold: isMatch, size, color: '111111', font: fontFamily })
+        })
+    }
+    // Build runs for a skill line of the form "Category: item1, item2"
+    // Highlight (bold) the category label only; leave the items unhighlighted/plain.
+    const buildHighlightedSkillRuns = (text: string, size = 21) => {
+      if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
+      const idx = text.indexOf(':')
+      if (idx === -1) {
+        // no category separator — render as plain highlighted runs (keywords elsewhere still bold)
+        return buildHighlightedRuns(text, size)
+      }
+      const prefix = text.slice(0, idx + 1) + ' '
+      const rest = text.slice(idx + 1).trim()
+      // category label should be bold
+      const prefixRun = new TextRun({ text: prefix, bold: true, size, color: '111111', font: fontFamily })
+      // items should be plain (no keyword highlighting here)
+      const restRun = new TextRun({ text: rest, size, color: '111111', font: fontFamily })
+      return [prefixRun, restRun]
     }
     const experienceLine = (
       left: string,
@@ -539,13 +842,7 @@ Return ONLY JSON (no markdown).`,
         children: [new TextRun({ text, size: 19, color: '555555', font: fontFamily })],
         spacing: { after: 60 },
       })
-    const buildSkillRows = (skills: string[], columns = 3) => {
-      const rows: string[][] = []
-      for (let i = 0; i < skills.length; i += columns) {
-        rows.push(skills.slice(i, i + columns))
-      }
-      return rows
-    }
+    
     const doc = new Document({
       styles: {
         default: {
@@ -654,48 +951,16 @@ Return ONLY JSON (no markdown).`,
               spacing: { after: 140 },
             }),
             sectionHeading('TECHNICAL SKILLS'),
-            new Table({
-              width: { size: 100, type: WidthType.PERCENTAGE },
-              layout: TableLayoutType.FIXED,
-              borders: {
-                top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                insideVertical: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-              },
-              rows: buildSkillRows(draft.skills).map((row) =>
-                new TableRow({
-                  children: Array.from({ length: 3 }).map((_, index) =>
-                    new TableCell({
-                      width: { size: 33.33, type: WidthType.PERCENTAGE },
-                      borders: {
-                        top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                        bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                        left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                        right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                      },
-                      margins: { top: 0, bottom: 0, left: 0, right: 0 },
-                      children: [
-                        new Paragraph({
-                          children: [
-                            new TextRun({
-                              text: row[index] ? `• ${row[index]}` : '',
-                              size: 20,
-                              color: '111111',
-                              font: fontFamily,
-                            }),
-                          ],
-                          indent: { left: 180, hanging: 90 },
-                          spacing: { after: 60 },
-                        }),
-                      ],
-                    }),
-                  ),
+              // Render each skill display line as a full-width bullet (not a multi-column grid)
+              // displaySkills contains lines like "Frontend: React, TypeScript" or uncategorized skills
+              ...displaySkills.map((line) =>
+                new Paragraph({
+                  children: buildHighlightedSkillRuns(line, 20),
+                  bullet: { level: 0 },
+                  alignment: AlignmentType.LEFT,
+                  spacing: { after: 60 },
                 }),
               ),
-            }),
             new Paragraph({ text: '', spacing: { after: 80 } }),
             sectionHeading('EXPERIENCE'),
             ...draft.workHistory.flatMap((item) => [
