@@ -181,14 +181,13 @@ const sanitizeFilePart = (value: string, fallback: string) => {
 
 const buildFileNames = (
   profile: ReturnType<typeof useAuth>['profile'],
-  draft: ResumeDraft,
   companyName: string,
+  role?: string,
 ): SavedFiles => {
-  const firstName = sanitizeFilePart(profile?.first_name ?? '', 'first')
-  const lastName = sanitizeFilePart(profile?.last_name ?? '', 'last')
-  const skillSlug = sanitizeFilePart(draft.skills.slice(0, 3).join('-'), 'skills')
-  const companySlug = sanitizeFilePart(companyName, 'company')
-  const baseName = `${firstName}_${lastName}_${skillSlug}_${companySlug}`
+  // New naming: use role + company (sanitized) per UX request
+  const roleSlug = sanitizeFilePart(role ?? profile?.role_title ?? '', 'role')
+  const companySlug = sanitizeFilePart(companyName ?? '', 'company')
+  const baseName = `${roleSlug}_${companySlug}`
   return {
     resume: `${baseName}_resume.docx`,
     coverLetter: `${baseName}_cover-letter.txt`,
@@ -660,7 +659,7 @@ If you understand, return the single JSON object now.`,
     setError(null)
     const resolvedCompanyName = companyName.trim()
     const resolvedJobTitle = jobTitle.trim()
-  const fileNames = buildFileNames(profile, draft, resolvedCompanyName)
+    const fileNames = buildFileNames(profile, resolvedCompanyName, resolvedJobTitle)
     const { error: insertError } = await supabase.from('applied_jobs').insert({
       profile_id: profile.id,
       company_name: resolvedCompanyName || null,
@@ -692,7 +691,7 @@ If you understand, return the single JSON object now.`,
 
   const handleDownloadResume = async () => {
     const resolvedCompanyName = companyName.trim()
-    const fileNames = savedFiles ?? buildFileNames(profile, draft, resolvedCompanyName)
+  const fileNames = savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
     const fullName = `${profile?.first_name ?? ''} ${profile?.last_name ?? ''}`.trim()
     const titleLine = profile?.role_title ?? ''
     const locationLine = profile?.location ?? ''
@@ -1018,7 +1017,7 @@ If you understand, return the single JSON object now.`,
 
   const handleDownloadCoverLetter = () => {
     const resolvedCompanyName = companyName.trim()
-  const fileNames = savedFiles ?? buildFileNames(profile, draft, resolvedCompanyName)
+  const fileNames = savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
     const blob = new Blob([draft.coverLetter], { type: 'text/plain;charset=utf-8' })
     saveAs(blob, fileNames.coverLetter)
   }
