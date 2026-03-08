@@ -179,15 +179,21 @@ const sanitizeFilePart = (value: string, fallback: string) => {
   return sanitized || fallback
 }
 
+const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
+  [profile?.first_name, profile?.middle_name, profile?.last_name]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .join(' ')
+    .trim()
+
 const buildFileNames = (
   profile: ReturnType<typeof useAuth>['profile'],
   companyName: string,
   role?: string,
 ): SavedFiles => {
-  // New naming: use role + company (sanitized) per UX request
+  const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
   const roleSlug = sanitizeFilePart(role ?? profile?.role_title ?? '', 'role')
   const companySlug = sanitizeFilePart(companyName ?? '', 'company')
-  const baseName = `${roleSlug}_${companySlug}`
+  const baseName = `${fullNameSlug}_${roleSlug}_${companySlug}`
   return {
     resume: `${baseName}_resume.docx`,
     coverLetter: `${baseName}_cover-letter.txt`,
@@ -296,7 +302,7 @@ export default function ResumeBuilder() {
     const careerStartYear = startYears.length > 0 ? Math.min(...startYears) : undefined
     const careerEndYear = endYears.length > 0 ? Math.max(...endYears) : undefined
     const payload = {
-      candidateName: `${profile?.first_name ?? ''} ${profile?.last_name ?? ''}`.trim(),
+      candidateName: buildCandidateFullName(profile),
       careerStartYear,
       careerEndYear,
       summary: draft.summary,
@@ -691,8 +697,9 @@ If you understand, return the single JSON object now.`,
 
   const handleDownloadResume = async () => {
     const resolvedCompanyName = companyName.trim()
-  const fileNames = savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
-    const fullName = `${profile?.first_name ?? ''} ${profile?.last_name ?? ''}`.trim()
+    const fileNames =
+      savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
+    const fullName = buildCandidateFullName(profile)
     const titleLine = profile?.role_title ?? ''
     const locationLine = profile?.location ?? ''
     const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url]
