@@ -5,6 +5,7 @@ import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../hooks/useAuth'
 import type { AppliedJob } from '../types'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 type AppliedJobRow = AppliedJob & {
   profiles?: {
@@ -47,7 +48,9 @@ export default function AppliedJobDetail() {
 
   const fetchEntry = useCallback(async () => {
     if (!id) {
-      setError('Missing application id.')
+      const msg = 'Missing application id.'
+      setError(msg)
+      toast.error(msg)
       return
     }
     setLoading(true)
@@ -64,6 +67,7 @@ export default function AppliedJobDetail() {
     const { data, error: fetchError } = await query.single()
     if (fetchError) {
       setError(fetchError.message)
+      toast.error(fetchError.message)
       setEntry(null)
     } else {
       setEntry((data as AppliedJobRow) ?? null)

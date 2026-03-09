@@ -3,6 +3,7 @@ import { FiEye, FiEyeOff, FiLock } from 'react-icons/fi'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 export default function ChangePassword() {
   const { changePassword } = useAuth()
@@ -38,19 +39,23 @@ export default function ChangePassword() {
     setSuccess(null)
 
     if (!form.currentPassword) {
-      setError('Please enter your current password.')
+      const msg = 'Please enter your current password.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     if (!validatePassword(form.newPassword)) {
-      setError(
-        'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.',
-      )
+      const msg = 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     if (form.newPassword !== form.confirmPassword) {
-      setError('Passwords do not match.')
+      const msg = 'Passwords do not match.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
@@ -58,11 +63,14 @@ export default function ChangePassword() {
     const message = await changePassword(form.currentPassword, form.newPassword)
     if (message) {
       setError(message)
+      toast.error(message)
       setLoading(false)
       return
     }
 
-    setSuccess('Password updated. Use the new password next time you sign in.')
+  const successMsg = 'Password updated. Use the new password next time you sign in.'
+  setSuccess(successMsg)
+  toast.success(successMsg)
     setForm({ currentPassword: '', newPassword: '', confirmPassword: '' })
     setLoading(false)
   }

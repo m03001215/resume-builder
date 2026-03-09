@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../hooks/useAuth'
 import type { Profile } from '../types'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 export default function Admin() {
   const { session } = useAuth()
@@ -22,6 +23,7 @@ export default function Admin() {
 
     if (fetchError) {
       setError(fetchError.message)
+      toast.error(fetchError.message)
       setProfiles([])
     } else {
       setError(null)
@@ -74,6 +76,7 @@ export default function Admin() {
 
     if (approveError) {
       setError(approveError.message)
+      toast.error(approveError.message)
       return
     }
     fetchProfiles()
@@ -94,6 +97,7 @@ export default function Admin() {
 
     if (educationDeleteError) {
       setError(educationDeleteError.message)
+      toast.error(educationDeleteError.message)
       return
     }
 
@@ -104,6 +108,7 @@ export default function Admin() {
 
     if (companyDeleteError) {
       setError(companyDeleteError.message)
+      toast.error(companyDeleteError.message)
       return
     }
 
@@ -114,11 +119,13 @@ export default function Admin() {
 
     if (deleteError) {
       setError(deleteError.message)
+      toast.error(deleteError.message)
       return
     }
 
-    setSelectedIds(new Set())
-    fetchProfiles()
+  setSelectedIds(new Set())
+  toast.success('Selected users deleted')
+  fetchProfiles()
   }
 
   useEffect(() => {

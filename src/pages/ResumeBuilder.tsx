@@ -24,9 +24,9 @@ import {
   TextRun,
   WidthType,
 } from 'docx'
-import { saveAs } from 'file-saver'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 import { supabase } from '../lib/supabaseClient'
 
 type WorkHistoryItem = {
@@ -215,13 +215,148 @@ export default function ResumeBuilder() {
   const [isSaving, setIsSaving] = useState(false)
   const [isSaved, setIsSaved] = useState(false)
   const [hasGenerated, setHasGenerated] = useState(false)
-  const [savedFiles, setSavedFiles] = useState<SavedFiles | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [skillInput, setSkillInput] = useState('')
+  const [downloadHandle, setDownloadHandle] = useState<FileSystemDirectoryHandle | null>(null)
+  const [downloadHandleName, setDownloadHandleName] = useState<string | null>(null)
+
+  // IndexedDB helpers to persist FileSystemDirectoryHandle (structuredClone-capable in supporting browsers)
+  const IDB_DB = 'resume-generator-handles'
+  const IDB_STORE = 'handles'
+
+  const saveHandleToIDB = async (handle: FileSystemDirectoryHandle) => {
+    return new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open(IDB_DB, 1)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE)
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        try {
+          const tx = db.transaction(IDB_STORE, 'readwrite')
+          tx.objectStore(IDB_STORE).put(handle, 'download')
+          tx.oncomplete = () => {
+            db.close()
+            resolve()
+          }
+          tx.onerror = () => reject(tx.error)
+        } catch (err) {
+          db.close()
+          reject(err)
+        }
+      }
+      req.onerror = () => reject(req.error)
+    })
+  }
+
+  const getHandleFromIDB = async (): Promise<FileSystemDirectoryHandle | null> => {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_DB, 1)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE)
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        try {
+          if (!db.objectStoreNames.contains(IDB_STORE)) {
+            db.close()
+            resolve(null)
+            return
+          }
+          const tx = db.transaction(IDB_STORE, 'readonly')
+          const getReq = tx.objectStore(IDB_STORE).get('download')
+          getReq.onsuccess = () => {
+            const res = getReq.result ?? null
+            db.close()
+            resolve(res)
+          }
+          getReq.onerror = () => reject(getReq.error)
+        } catch (err) {
+          db.close()
+          reject(err)
+        }
+      }
+      req.onerror = () => reject(req.error)
+    })
+  }
+
+  const clearHandleFromIDB = async () => {
+    return new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open(IDB_DB, 1)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE)
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        try {
+          const tx = db.transaction(IDB_STORE, 'readwrite')
+          tx.objectStore(IDB_STORE).delete('download')
+          tx.oncomplete = () => {
+            db.close()
+            resolve()
+          }
+          tx.onerror = () => reject(tx.error)
+        } catch (err) {
+          db.close()
+          reject(err)
+        }
+      }
+      req.onerror = () => reject(req.error)
+    })
+  }
+
+  // load persisted handle on mount (if available)
+  useEffect(() => {
+    let mounted = true
+    ;(async () => {
+      try {
+        const saved = await getHandleFromIDB()
+        if (mounted && saved) {
+          setDownloadHandle(saved)
+          // FileSystemDirectoryHandle typically has a 'name' property
+          setDownloadHandleName((saved as unknown as { name?: string }).name ?? null)
+        }
+      } catch {
+        // ignore
+      }
+    })()
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  const chooseDownloadFolder = async () => {
+    try {
+      const win = window as unknown as { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }
+      if (win && typeof win.showDirectoryPicker === 'function') {
+        const dir = await (win.showDirectoryPicker as unknown as () => Promise<FileSystemDirectoryHandle>)()
+        await saveHandleToIDB(dir)
+        setDownloadHandle(dir)
+        const name = (dir as unknown as { name?: string }).name ?? null
+        setDownloadHandleName(name)
+        toast.success(name ? `Download folder set: ${name}` : 'Download folder saved')
+      }
+    } catch {
+      // user cancelled or not supported
+    }
+  }
+
+  const clearSavedDownloadFolder = async () => {
+    try {
+      await clearHandleFromIDB()
+    } catch {
+      // ignore
+    }
+    setDownloadHandle(null)
+    setDownloadHandleName(null)
+    toast.success('Saved download folder cleared')
+  }
 
   const markUnsaved = () => {
     setIsSaved(false)
-    setSavedFiles(null)
     setHasGenerated(false)
   }
 
@@ -240,7 +375,6 @@ export default function ResumeBuilder() {
     setError(null)
     setIsSaved(false)
     setIsDraftDirty(false)
-    setSavedFiles(null)
     setHasGenerated(false)
   }
 
@@ -252,28 +386,38 @@ export default function ResumeBuilder() {
 
   const handleGenerate = async () => {
     if (!companies || companies.length === 0) {
-      setError('Please add at least one company before generating.')
+      const msg = 'Please add at least one company before generating.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     if (!educations || educations.length === 0) {
-      setError('Please add at least one education entry before generating.')
+      const msg = 'Please add at least one education entry before generating.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     if (!companyName.trim()) {
-      setError('Please enter a company name before generating.')
+      const msg = 'Please enter a company name before generating.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     if (!jobTitle.trim()) {
-      setError('Please enter a job title before generating.')
+      const msg = 'Please enter a job title before generating.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
     const jdLength = notes.trim().length
     if (jdLength < 100) {
-      setError('Job description must be at least 100 characters.')
+      const msg = 'Job description must be at least 100 characters.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
@@ -282,7 +426,9 @@ export default function ResumeBuilder() {
 
     const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
     if (!apiKey) {
-      setError('Missing OpenAI API key. Please add it to your environment variables.')
+      const msg = 'Missing OpenAI API key. Please add it to your environment variables.'
+      setError(msg)
+      toast.error(msg)
       setIsGenerating(false)
       return
     }
@@ -631,6 +777,7 @@ If you understand, return the single JSON object now.`,
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
+      toast.error(message)
       updateDraft((prev) => buildMockResume(prev, profile))
       setHasGenerated(true)
     } finally {
@@ -641,23 +788,33 @@ If you understand, return the single JSON object now.`,
   const handleSave = async () => {
     if (isSaved || isSaving) return
     if (!hasGenerated) {
-      setError('Please generate a resume before saving.')
+      const msg = 'Please generate a resume before saving.'
+      setError(msg)
+      toast.error(msg)
       return
     }
     if (!profile?.id) {
-      setError('Unable to save without a profile.')
+      const msg = 'Unable to save without a profile.'
+      setError(msg)
+      toast.error(msg)
       return
     }
     if (!companyName.trim()) {
-      setError('Please enter a company name before saving.')
+      const msg = 'Please enter a company name before saving.'
+      setError(msg)
+      toast.error(msg)
       return
     }
     if (!jobTitle.trim()) {
-      setError('Please enter a job title before saving.')
+      const msg = 'Please enter a job title before saving.'
+      setError(msg)
+      toast.error(msg)
       return
     }
     if (!notes.trim()) {
-      setError('Please add a job description before saving.')
+      const msg = 'Please add a job description before saving.'
+      setError(msg)
+      toast.error(msg)
       return
     }
 
@@ -678,11 +835,12 @@ If you understand, return the single JSON object now.`,
 
     if (insertError) {
       setError(insertError.message)
+      toast.error(insertError.message)
       setIsSaving(false)
       return
     }
 
-    setSavedFiles(fileNames)
+    // filenames persisted to DB via resume_name / cover_letter_name; no local savedFiles state
     setIsSaved(true)
     setIsSaving(false)
   }
@@ -696,9 +854,11 @@ If you understand, return the single JSON object now.`,
   }
 
   const handleDownloadResume = async () => {
-    const resolvedCompanyName = companyName.trim()
-    const fileNames =
-      savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
+    // Require user to choose a download folder explicitly
+    if (!downloadHandle) {
+      toast.error('Please choose the folder which saves resume and cover letter')
+      return
+    }
     const fullName = buildCandidateFullName(profile)
     const titleLine = profile?.role_title ?? ''
     const locationLine = profile?.location ?? ''
@@ -1019,15 +1179,34 @@ If you understand, return the single JSON object now.`,
     })
 
     const blob = await Packer.toBlob(doc)
-    saveAs(blob, fileNames.resume)
+    const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
+    const roleSlug = sanitizeFilePart(jobTitle || profile?.role_title || '', 'role')
+    const companySlug = sanitizeFilePart(companyName || '', 'company')
+    const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
+    const coverText = draft.coverLetter || ''
+
+    try {
+      const folderHandle = await downloadHandle.getDirectoryHandle(folderName, { create: true })
+      const resumeHandle = await folderHandle.getFileHandle('resume.docx', { create: true })
+      const resumeWritable = await resumeHandle.createWritable()
+      await resumeWritable.write(blob)
+      await resumeWritable.close()
+
+      const coverHandle = await folderHandle.getFileHandle('coverletter.txt', { create: true })
+      const coverWritable = await coverHandle.createWritable()
+      await coverWritable.write(new Blob([coverText], { type: 'text/plain;charset=utf-8' }))
+      await coverWritable.close()
+
+      toast.success(`Saved resume and cover letter to ${folderName}`)
+      return
+    } catch {
+      // writing to persisted handle failed - instruct user to reselect
+      toast.error('Unable to write to the selected folder. Please choose the folder again.')
+      return
+    }
   }
 
-  const handleDownloadCoverLetter = () => {
-    const resolvedCompanyName = companyName.trim()
-  const fileNames = savedFiles ?? buildFileNames(profile, resolvedCompanyName, jobTitle || profile?.role_title || '')
-    const blob = new Blob([draft.coverLetter], { type: 'text/plain;charset=utf-8' })
-    saveAs(blob, fileNames.coverLetter)
-  }
+  // cover-letter-specific handler removed: downloads now bundled with `handleDownloadResume`
 
   return (
     <div className="mx-auto w-full max-w-5xl px-6 py-10">
@@ -1115,6 +1294,29 @@ If you understand, return the single JSON object now.`,
             className="mt-4 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
           />
           {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={chooseDownloadFolder}
+              className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-400 hover:text-white"
+            >
+              Choose download folder
+            </button>
+            {downloadHandleName ? (
+              <div className="flex items-center gap-2 text-xs text-slate-300">
+                <span>Folder: <strong className="text-slate-100">{downloadHandleName}</strong></span>
+                <button
+                  type="button"
+                  onClick={clearSavedDownloadFolder}
+                  className="inline-flex items-center gap-1 rounded-full border border-white/10 px-2 py-1 text-xs font-semibold text-rose-300 transition hover:border-rose-400 hover:text-white"
+                >
+                  Clear
+                </button>
+              </div>
+            ) : (
+              <span className="text-xs text-slate-400">No saved download folder (Chrome/Edge only)</span>
+            )}
+          </div>
         </section>
 
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
@@ -1370,16 +1572,9 @@ If you understand, return the single JSON object now.`,
             disabled={!isSaved || isSaving}
             className="inline-flex items-center gap-2 rounded-full border border-white/10 px-5 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <FiDownload /> Download resume
+            <FiDownload /> Download
           </button>
-          <button
-            type="button"
-            onClick={handleDownloadCoverLetter}
-            disabled={!isSaved || isSaving}
-            className="inline-flex items-center gap-2 rounded-full border border-white/10 px-5 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <FiDownload /> Download cover letter
-          </button>
+          {/* cover letter download removed - unified into single Download button */}
         </section>
       </div>
     </div>

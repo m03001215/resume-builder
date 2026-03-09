@@ -3,6 +3,7 @@ import { FiEye, FiEyeOff, FiLock, FiMail } from 'react-icons/fi'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 export default function SignIn() {
   const { signIn } = useAuth()
@@ -17,7 +18,10 @@ export default function SignIn() {
     setLoading(true)
     setError(null)
     const message = await signIn(email, password)
-    if (message) setError(message)
+    if (message) {
+      setError(message)
+      toast.error(message)
+    }
     setLoading(false)
   }
 

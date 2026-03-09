@@ -5,6 +5,7 @@ import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../hooks/useAuth'
 import type { AppliedJob } from '../types'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 type AppliedJobRow = AppliedJob & {
   profiles?: {
@@ -72,6 +73,7 @@ export default function AppliedJobHistory() {
     const { data, error: fetchError, count } = await query
     if (fetchError) {
       setError(fetchError.message)
+      toast.error(fetchError.message)
       setEntries([])
     } else {
       const nextTotalPages = Math.max(1, Math.ceil((count ?? 0) / pageSize))

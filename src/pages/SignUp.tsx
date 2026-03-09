@@ -3,6 +3,7 @@ import { FiBriefcase, FiEye, FiEyeOff, FiLock, FiMail, FiMapPin, FiPhone, FiUser
 import { Link } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
+import toast from 'react-hot-toast'
 
 export default function SignUp() {
   const { signUp } = useAuth()
@@ -54,34 +55,44 @@ export default function SignUp() {
     setLoading(true)
     setError(null)
     if (!validateEmail(form.email)) {
-      setError('Please enter a valid email address.')
+      const msg = 'Please enter a valid email address.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
     if (!validatePassword(form.password)) {
-      setError(
-        'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.',
-      )
+      const msg = 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
     if (form.password !== form.confirmPassword) {
-      setError('Passwords do not match.')
+      const msg = 'Passwords do not match.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
     if (!validateLinkedIn(form.linkedinUrl)) {
-      setError('LinkedIn URL must be a valid linkedin.com link.')
+      const msg = 'LinkedIn URL must be a valid linkedin.com link.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
     if (!form.roleTitle.trim()) {
-      setError('Please enter your role.')
+      const msg = 'Please enter your role.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
     if (!form.location.trim()) {
-      setError('Please enter your location.')
+      const msg = 'Please enter your location.'
+      setError(msg)
+      toast.error(msg)
       setLoading(false)
       return
     }
@@ -96,7 +107,10 @@ export default function SignUp() {
       linkedinUrl: form.linkedinUrl || undefined,
       phoneNumber: form.phoneNumber || undefined,
     })
-    if (message) setError(message)
+    if (message) {
+      setError(message)
+      toast.error(message)
+    }
     setLoading(false)
   }
 
