@@ -24,6 +24,7 @@ import {
   TextRun,
   WidthType,
 } from 'docx'
+import jsPDF from 'jspdf'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
 import toast from 'react-hot-toast'
@@ -179,24 +180,470 @@ const sanitizeFilePart = (value: string, fallback: string) => {
   return sanitized || fallback
 }
 
+const sanitizeFileName = (value: string, fallback: string) => {
+  const cleaned = value
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ') // Windows-invalid + control chars
+    .replace(/\s+/g, ' ')
+    .trim()
+  const truncated = cleaned.length > 120 ? cleaned.slice(0, 120).trim() : cleaned
+  return truncated || fallback
+}
+
 const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
   [profile?.first_name, profile?.middle_name, profile?.last_name]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' ')
     .trim()
 
+const buildResumePdfBlobDocxStyle = (args: {
+  profile: ReturnType<typeof useAuth>['profile']
+  draft: ResumeDraft
+  companyName: string
+  jobTitle: string
+}) => {
+  const { profile, draft, jobTitle } = args
+  const fullName = buildCandidateFullName(profile) || 'Candidate'
+  const titleLine = profile?.role_title?.trim() || jobTitle.trim()
+  const locationLine = profile?.location?.trim() || ''
+  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .join(' | ')
+
+  // Uses built-in PDF fonts (Helvetica); DOCX uses Arial.
+  // We match DOCX sizes, spacing, alignment, and colors as closely as possible.
+  const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+  const pageWidth = pdf.internal.pageSize.getWidth()
+  const pageHeight = pdf.internal.pageSize.getHeight()
+  const margin = 54 // 1080 twips = 0.75in
+  const maxWidth = pageWidth - margin * 2
+
+  // PDF spacing controls (tune UX here).
+  const PDF_SPACING = {
+    sectionHeadingToContent: 16, // gap after underline to first content line
+    summaryLineHeight: 16,
+    summaryAfter: 20,
+    bulletLineHeight: 16,
+    bulletAfter: 12, // space between bullet points
+    skillBulletAfter: 14,
+    experienceTitleToCompany: 10, // space between title line and company line
+    experienceCompanyToBullets: 12, // space between company line and first bullet
+    experienceAfterJob: 18, // space between jobs
+    educationLineHeight: 16,
+    educationMetaLineHeight: 14,
+    footerLineHeight: 14,
+  }
+
+  const hexToRgb = (hex: string) => {
+    const normalized = hex.replace('#', '')
+    const full = normalized.length === 3 ? normalized.split('').map((c) => c + c).join('') : normalized
+    const r = parseInt(full.slice(0, 2), 16)
+    const g = parseInt(full.slice(2, 4), 16)
+    const b = parseInt(full.slice(4, 6), 16)
+    return { r, g, b }
+  }
+  const setTextColorHex = (hex: string) => {
+    const { r, g, b } = hexToRgb(hex)
+    pdf.setTextColor(r, g, b)
+  }
+
+  const ensureSpace = (y: number, needed: number) => {
+    if (y + needed <= pageHeight - margin) return y
+    pdf.addPage()
+    return margin
+  }
+
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  // Keyword highlighting logic matches DOCX generator.
+  let displaySkills: string[]
+  let flatKeywords: string[]
+  if (Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0) {
+    displaySkills = draft.skillDisplayLines
+    flatKeywords = draft.skillDisplayLines
+      .map((line) => line.split(':').slice(1).join(':'))
+      .map((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
+      .flat()
+  } else {
+    const rawSkills = draft.skills.map((s) => s.trim()).filter(Boolean)
+    const categoryMap: Record<string, string[]> = {}
+    const uncategorized: string[] = []
+    for (const s of rawSkills) {
+      const parts = s.split(':').map((p) => p.trim()).filter(Boolean)
+      if (parts.length >= 2) {
+        const category = parts[0]
+        const item = parts.slice(1).join(':')
+        categoryMap[category] = categoryMap[category] ?? []
+        if (!categoryMap[category].includes(item)) categoryMap[category].push(item)
+      } else {
+        if (!uncategorized.includes(s)) uncategorized.push(s)
+      }
+    }
+    displaySkills = [
+      ...Object.keys(categoryMap).map((cat) => `${cat}: ${categoryMap[cat].join(', ')}`),
+      ...uncategorized,
+    ]
+    flatKeywords = Array.from(new Set(rawSkills.concat(...Object.values(categoryMap))))
+  }
+
+  const extraTokens = flatKeywords
+    .map((k) => k.split(/[\s,/\-()]+/).map((t) => t.trim()).filter(Boolean))
+    .flat()
+  const keywordSet = new Set<string>([
+    ...flatKeywords.map((k) => k.trim()).filter(Boolean),
+    ...extraTokens.map((k) => k.trim()).filter(Boolean),
+  ])
+  const keywordList = Array.from(keywordSet).filter(Boolean).sort((a, b) => b.length - a.length)
+  const keywordLower = new Set(keywordList.map((k) => k.toLowerCase()))
+
+  type Token = { text: string; bold: boolean }
+
+  const buildHighlightedTokens = (text: string): Token[] => {
+    if (!text) return [{ text, bold: false }]
+    if (keywordList.length === 0) return [{ text, bold: false }]
+    const pattern = new RegExp(`\\b(${keywordList.map(escapeRegExp).join('|')})\\b`, 'gi')
+    return text
+      .split(pattern)
+      .filter((chunk) => chunk.length > 0)
+      .map((chunk) => ({ text: chunk, bold: keywordLower.has(chunk.toLowerCase()) }))
+  }
+
+  const buildSkillTokens = (text: string): Token[] => {
+    const idx = text.indexOf(':')
+    if (idx === -1) return [{ text, bold: false }]
+    const prefix = text.slice(0, idx + 1) + ' '
+    const rest = text.slice(idx + 1).trim()
+    return [
+      { text: prefix, bold: true },
+      { text: rest, bold: false },
+    ]
+  }
+
+  const expandWhitespace = (tokens: Token[]) => {
+    const expanded: Token[] = []
+    for (const token of tokens) {
+      const parts = token.text.split(/(\s+)/).filter(Boolean)
+      for (const part of parts) expanded.push({ text: part, bold: token.bold })
+    }
+    return expanded
+  }
+
+  const measure = (text: string, size: number, bold: boolean) => {
+    pdf.setFont('helvetica', bold ? 'bold' : 'normal')
+    pdf.setFontSize(size)
+    return pdf.getTextWidth(text)
+  }
+
+  const drawWrappedTokens = (opts: {
+    tokens: Token[]
+    x: number
+    y: number
+    maxWidth: number
+    fontSize: number
+    lineHeight: number
+    colorHex: string
+  }) => {
+    setTextColorHex(opts.colorHex)
+    const expanded = expandWhitespace(opts.tokens)
+    let x = opts.x
+    let y = opts.y
+    const xMax = opts.x + opts.maxWidth
+
+    for (const token of expanded) {
+      if (x === opts.x && /^\s+$/.test(token.text)) continue
+      const w = measure(token.text, opts.fontSize, token.bold)
+      if (x + w > xMax && !/^\s+$/.test(token.text)) {
+        y = ensureSpace(y + opts.lineHeight, opts.lineHeight)
+        x = opts.x
+      }
+      pdf.setFont('helvetica', token.bold ? 'bold' : 'normal')
+      pdf.setFontSize(opts.fontSize)
+      pdf.text(token.text, x, y)
+      x += w
+    }
+    return y
+  }
+
+  const drawCenteredWrapped = (text: string, y: number, size: number, bold: boolean, colorHex: string) => {
+    pdf.setFont('helvetica', bold ? 'bold' : 'normal')
+    pdf.setFontSize(size)
+    setTextColorHex(colorHex)
+    const lines = pdf.splitTextToSize(text, maxWidth) as string[]
+    for (const line of lines) {
+      y = ensureSpace(y, size + 6)
+      pdf.text(line, pageWidth / 2, y, { align: 'center' })
+      y += size + 4
+    }
+    return y
+  }
+
+  const drawDivider = (y: number) => {
+    y = ensureSpace(y, 10)
+    pdf.setDrawColor(0, 0, 0)
+    pdf.setLineWidth(2.25) // matches DOCX table border thickness
+    pdf.line(margin, y, pageWidth - margin, y)
+    pdf.setLineWidth(1)
+    return y + 18
+  }
+
+  const drawSectionHeading = (label: string, y: number) => {
+    y = ensureSpace(y + 10, 18) // before: 10pt
+    pdf.setFont('helvetica', 'bold')
+    pdf.setFontSize(10.5) // 21 half-points
+    setTextColorHex('111111')
+    pdf.text(label, margin, y)
+    y += 6
+    const { r, g, b } = hexToRgb('333333')
+    pdf.setDrawColor(r, g, b)
+    pdf.setLineWidth(1.5) // DOCX border size 12
+    pdf.line(margin, y, pageWidth - margin, y)
+    pdf.setLineWidth(1)
+    return y + PDF_SPACING.sectionHeadingToContent
+  }
+
+  const drawExperienceLine = (opts: {
+    left: string
+    right: string
+    y: number
+    boldLeft: boolean
+    leftColorHex: string
+    leftSize: number
+    rightSize: number
+  }) => {
+    let y = ensureSpace(opts.y, 16)
+
+    // reserve space for right column to avoid overlap
+    pdf.setFont('helvetica', 'normal')
+    pdf.setFontSize(opts.rightSize)
+    setTextColorHex('555555')
+    const rightWidth = opts.right ? pdf.getTextWidth(opts.right) : 0
+    const leftMax = Math.max(120, maxWidth - rightWidth - 12)
+    const leftLines = pdf.splitTextToSize(opts.left, leftMax) as string[]
+
+    pdf.setFont('helvetica', opts.boldLeft ? 'bold' : 'normal')
+    pdf.setFontSize(opts.leftSize)
+    setTextColorHex(opts.leftColorHex)
+    pdf.text(leftLines[0] || '', margin, y)
+
+    if (opts.right) {
+      pdf.setFont('helvetica', 'normal')
+      pdf.setFontSize(opts.rightSize)
+      setTextColorHex('555555')
+      pdf.text(opts.right, pageWidth - margin, y, { align: 'right' })
+    }
+
+    for (const line of leftLines.slice(1)) {
+      y = ensureSpace(y + 14, 14)
+      pdf.setFont('helvetica', opts.boldLeft ? 'bold' : 'normal')
+      pdf.setFontSize(opts.leftSize)
+      setTextColorHex(opts.leftColorHex)
+      pdf.text(line, margin, y)
+    }
+
+    return y + 8
+  }
+
+  const drawBullet = (text: string, y: number) => {
+    const lineHeight = PDF_SPACING.bulletLineHeight
+    y = ensureSpace(y, lineHeight)
+    pdf.setFont('helvetica', 'normal')
+    pdf.setFontSize(10) // 20 half-points
+    setTextColorHex('111111')
+    pdf.text('•', margin, y)
+    y = drawWrappedTokens({
+      tokens: buildHighlightedTokens(text),
+      x: margin + 12,
+      y,
+      maxWidth: maxWidth - 12,
+      fontSize: 10,
+      lineHeight,
+      colorHex: '111111',
+    })
+    return y + PDF_SPACING.bulletAfter
+  }
+
+  const drawSkillBullet = (text: string, y: number) => {
+    const lineHeight = PDF_SPACING.bulletLineHeight
+    y = ensureSpace(y, lineHeight)
+    pdf.setFont('helvetica', 'normal')
+    pdf.setFontSize(10)
+    setTextColorHex('111111')
+    pdf.text('•', margin, y)
+    y = drawWrappedTokens({
+      tokens: buildSkillTokens(text),
+      x: margin + 12,
+      y,
+      maxWidth: maxWidth - 12,
+      fontSize: 10,
+      lineHeight,
+      colorHex: '111111',
+    })
+    return y + PDF_SPACING.skillBulletAfter
+  }
+
+  // --- Render (mirrors DOCX order/labels) ---
+  let y = margin
+  y = drawCenteredWrapped(fullName, y, 19, true, '111111')
+  y += 2
+  if (titleLine) y = drawCenteredWrapped(titleLine, y, 11.5, true, '333333')
+  if (locationLine) y = drawCenteredWrapped(locationLine, y, 10, false, '555555')
+  if (contactLine) y = drawCenteredWrapped(contactLine, y, 10, false, '555555')
+  y = drawDivider(y)
+
+  y = drawSectionHeading('SUMMARY', y)
+  const summary = (draft.summary || '').trim()
+  if (summary) {
+    y = drawWrappedTokens({
+      tokens: buildHighlightedTokens(summary),
+      x: margin,
+      y,
+      maxWidth,
+      fontSize: 10.5, // 21 half-points
+      lineHeight: PDF_SPACING.summaryLineHeight,
+      colorHex: '111111',
+    })
+    y += PDF_SPACING.summaryAfter
+  } else {
+    y += 10
+  }
+
+  y = drawSectionHeading('TECHNICAL SKILLS', y)
+  for (const line of displaySkills.map((s) => s.trim()).filter(Boolean)) {
+    y = drawSkillBullet(line, y)
+  }
+  y += 6
+
+  y = drawSectionHeading('EXPERIENCE', y)
+  for (const item of draft.workHistory) {
+    const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
+    const locMode = [item.location, workModeLabel(item.workMode)].filter(Boolean).join(' | ')
+
+    y = drawExperienceLine({
+      left: item.title || 'Role',
+      right: dates,
+      y,
+      boldLeft: true,
+      leftColorHex: '111111',
+      leftSize: 10.5,
+      rightSize: 9.5,
+    })
+
+    y = ensureSpace(y + PDF_SPACING.experienceTitleToCompany, PDF_SPACING.experienceTitleToCompany)
+    y = drawExperienceLine({
+      left: item.company || 'Company',
+      right: locMode,
+      y,
+      boldLeft: false,
+      leftColorHex: '1f4e79',
+      leftSize: 10.5,
+      rightSize: 9.5,
+    })
+
+    y = ensureSpace(y + PDF_SPACING.experienceCompanyToBullets, PDF_SPACING.experienceCompanyToBullets)
+    const bullets = (item.bullets ?? []).map((b) => b.trim()).filter(Boolean)
+    for (const bullet of bullets) {
+      y = drawBullet(bullet, y)
+    }
+    y = ensureSpace(y + PDF_SPACING.experienceAfterJob, PDF_SPACING.experienceAfterJob)
+  }
+
+  y = drawSectionHeading('EDUCATION', y)
+  for (const edu of draft.education) {
+    const degree = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
+    const meta = [
+      [edu.school, edu.location].filter(Boolean).join(' | '),
+      `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+    ]
+      .filter(Boolean)
+      .join(' | ')
+
+    y = ensureSpace(y, 16)
+    pdf.setFont('helvetica', 'bold')
+    pdf.setFontSize(10.5)
+    setTextColorHex('111111')
+    for (const line of (pdf.splitTextToSize(degree || ' ', maxWidth) as string[])) {
+      y = ensureSpace(y, PDF_SPACING.educationLineHeight)
+      pdf.text(line, margin, y)
+      y += PDF_SPACING.educationLineHeight
+    }
+
+    pdf.setFont('helvetica', 'normal')
+    pdf.setFontSize(9.5)
+    setTextColorHex('555555')
+    for (const line of (pdf.splitTextToSize(meta || ' ', maxWidth) as string[])) {
+      y = ensureSpace(y, PDF_SPACING.educationMetaLineHeight)
+      pdf.text(line, margin, y)
+      y += PDF_SPACING.educationMetaLineHeight
+    }
+
+    y += 6
+  }
+
+  return pdf.output('blob')
+}
+
+const buildCoverLetterPdfBlob = (args: {
+  profile: ReturnType<typeof useAuth>['profile']
+  draft: ResumeDraft
+}) => {
+  const { profile, draft } = args
+  const fullName = buildCandidateFullName(profile) || 'Candidate'
+  const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+  const pageWidth = pdf.internal.pageSize.getWidth()
+  const pageHeight = pdf.internal.pageSize.getHeight()
+  const margin = 54
+  const maxWidth = pageWidth - margin * 2
+
+  const ensureSpace = (y: number, needed: number) => {
+    if (y + needed <= pageHeight - margin) return y
+    pdf.addPage()
+    return margin
+  }
+
+  let y = margin
+  pdf.setFont('helvetica', 'bold')
+  pdf.setFontSize(16)
+  pdf.text(`${fullName} — Cover Letter`, margin, y)
+  y += 22
+
+  pdf.setFont('helvetica', 'normal')
+  pdf.setFontSize(11)
+
+  const body = (draft.coverLetter || '').trim()
+  const paragraphs = body.length > 0 ? body.split(/\n{2,}/g) : []
+  if (paragraphs.length === 0) {
+    const wrapped = pdf.splitTextToSize('No cover letter text was generated.', maxWidth) as string[]
+    for (const line of wrapped) {
+      y = ensureSpace(y, 16)
+      pdf.text(line, margin, y)
+      y += 16
+    }
+    return pdf.output('blob')
+  }
+
+  for (const paragraph of paragraphs) {
+    const wrapped = pdf.splitTextToSize(paragraph.replace(/\n/g, ' ').trim(), maxWidth) as string[]
+    for (const line of wrapped) {
+      y = ensureSpace(y, 16)
+      pdf.text(line, margin, y)
+      y += 16
+    }
+    y += 22
+  }
+
+  return pdf.output('blob')
+}
+
 const buildFileNames = (
   profile: ReturnType<typeof useAuth>['profile'],
-  companyName: string,
+  _companyName: string,
   role?: string,
 ): SavedFiles => {
-  const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
-  const roleSlug = sanitizeFilePart(role ?? profile?.role_title ?? '', 'role')
-  const companySlug = sanitizeFilePart(companyName ?? '', 'company')
-  const baseName = `${fullNameSlug}_${roleSlug}_${companySlug}`
+  const fullName = sanitizeFileName(buildCandidateFullName(profile), 'Candidate')
+  const title = sanitizeFileName(role ?? profile?.role_title ?? '', 'Role')
+  const baseName = `${fullName} - ${title}`
   return {
-    resume: `${baseName}_resume.docx`,
-    coverLetter: `${baseName}_cover-letter.txt`,
+    resume: `${baseName}.docx`,
+    coverLetter: `${baseName} - Cover Letter.txt`,
   }
 }
 
@@ -219,6 +666,26 @@ export default function ResumeBuilder() {
   const [skillInput, setSkillInput] = useState('')
   const [downloadHandle, setDownloadHandle] = useState<FileSystemDirectoryHandle | null>(null)
   const [downloadHandleName, setDownloadHandleName] = useState<string | null>(null)
+
+  const ensureDirectoryReadWritePermission = async (handle: FileSystemDirectoryHandle) => {
+    const anyHandle = handle as unknown as {
+      queryPermission?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<string>
+      requestPermission?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<string>
+    }
+
+    if (typeof anyHandle.queryPermission !== 'function' || typeof anyHandle.requestPermission !== 'function') {
+      return true
+    }
+
+    try {
+      const current = await anyHandle.queryPermission({ mode: 'readwrite' })
+      if (current === 'granted') return true
+      const next = await anyHandle.requestPermission({ mode: 'readwrite' })
+      return next === 'granted'
+    } catch {
+      return false
+    }
+  }
 
   // IndexedDB helpers to persist FileSystemDirectoryHandle (structuredClone-capable in supporting browsers)
   const IDB_DB = 'resume-generator-handles'
@@ -333,6 +800,11 @@ export default function ResumeBuilder() {
       const win = window as unknown as { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }
       if (win && typeof win.showDirectoryPicker === 'function') {
         const dir = await (win.showDirectoryPicker as unknown as () => Promise<FileSystemDirectoryHandle>)()
+        const hasPermission = await ensureDirectoryReadWritePermission(dir)
+        if (!hasPermission) {
+          toast.error('Folder permission denied. Please choose a folder again.')
+          return
+        }
         await saveHandleToIDB(dir)
         setDownloadHandle(dir)
         const name = (dir as unknown as { name?: string }).name ?? null
@@ -859,6 +1331,13 @@ If you understand, return the single JSON object now.`,
       toast.error('Please choose the folder which saves resume and cover letter')
       return
     }
+
+    const hasPermission = await ensureDirectoryReadWritePermission(downloadHandle)
+    if (!hasPermission) {
+      toast.error('Please allow write access to the selected folder, or choose the folder again.')
+      return
+    }
+
     const fullName = buildCandidateFullName(profile)
     const titleLine = profile?.role_title ?? ''
     const locationLine = profile?.location ?? ''
@@ -1179,29 +1658,91 @@ If you understand, return the single JSON object now.`,
     })
 
     const blob = await Packer.toBlob(doc)
+    const resumePdfBlob = buildResumePdfBlobDocxStyle({
+      profile,
+      draft,
+      companyName: companyName || '',
+      jobTitle: jobTitle || '',
+    })
     const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
     const roleSlug = sanitizeFilePart(jobTitle || profile?.role_title || '', 'role')
     const companySlug = sanitizeFilePart(companyName || '', 'company')
     const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
     const coverText = draft.coverLetter || ''
+    const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft })
 
-    try {
-      const folderHandle = await downloadHandle.getDirectoryHandle(folderName, { create: true })
-      const resumeHandle = await folderHandle.getFileHandle('resume.docx', { create: true })
+    const resumeBaseName = sanitizeFileName(
+      `${buildCandidateFullName(profile) || 'Candidate'} - ${jobTitle || profile?.role_title || 'Role'}`,
+      'Resume',
+    )
+    const resumeDocxName = `${resumeBaseName}.docx`
+    const resumePdfName = `${resumeBaseName}.pdf`
+
+    const writeAllFilesToFolder = async (baseDir: FileSystemDirectoryHandle) => {
+      const folderHandle = await baseDir.getDirectoryHandle(folderName, { create: true })
+      const folderHasPermission = await ensureDirectoryReadWritePermission(folderHandle)
+      if (!folderHasPermission) {
+        throw new Error('Permission denied')
+      }
+
+      const resumeHandle = await folderHandle.getFileHandle(resumeDocxName, { create: true })
       const resumeWritable = await resumeHandle.createWritable()
       await resumeWritable.write(blob)
       await resumeWritable.close()
+
+      const resumePdfHandle = await folderHandle.getFileHandle(resumePdfName, { create: true })
+      const resumePdfWritable = await resumePdfHandle.createWritable()
+      await resumePdfWritable.write(resumePdfBlob)
+      await resumePdfWritable.close()
 
       const coverHandle = await folderHandle.getFileHandle('coverletter.txt', { create: true })
       const coverWritable = await coverHandle.createWritable()
       await coverWritable.write(new Blob([coverText], { type: 'text/plain;charset=utf-8' }))
       await coverWritable.close()
 
-      toast.success(`Saved resume and cover letter to ${folderName}`)
+      const coverPdfHandle = await folderHandle.getFileHandle('coverletter.pdf', { create: true })
+      const coverPdfWritable = await coverPdfHandle.createWritable()
+      await coverPdfWritable.write(coverPdfBlob)
+      await coverPdfWritable.close()
+    }
+
+    try {
+      await writeAllFilesToFolder(downloadHandle)
+      toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
       return
-    } catch {
-      // writing to persisted handle failed - instruct user to reselect
-      toast.error('Unable to write to the selected folder. Please choose the folder again.')
+    } catch (err) {
+      console.error(err)
+      const e = err as { name?: string; message?: string }
+      const details = [e?.name, e?.message].filter(Boolean).join(': ')
+      toast.error(
+        details
+          ? `Unable to write to the selected folder (${details}). Please choose the folder again.`
+          : 'Unable to write to the selected folder. Please choose the folder again.',
+      )
+
+      // Immediately prompt to re-pick a folder and retry.
+      try {
+        const win = window as unknown as { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }
+        if (!win || typeof win.showDirectoryPicker !== 'function') return
+
+        const dir = await win.showDirectoryPicker()
+        const hasPermission = await ensureDirectoryReadWritePermission(dir)
+        if (!hasPermission) {
+          toast.error('Folder permission denied. Please choose a folder again.')
+          return
+        }
+
+        await saveHandleToIDB(dir)
+        setDownloadHandle(dir)
+        const name = (dir as unknown as { name?: string }).name ?? null
+        setDownloadHandleName(name)
+
+        await writeAllFilesToFolder(dir)
+        toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
+      } catch (retryErr) {
+        console.error(retryErr)
+        toast.error('Unable to write to the selected folder. Please choose the folder again.')
+      }
       return
     }
   }
