@@ -33,6 +33,7 @@ type ProfileForm = {
   role_title: string
   location: string
   linkedin_url: string
+  github_url: string
   phone_number: string
 }
 
@@ -54,6 +55,7 @@ const createProfileForm = (profile: Profile): ProfileForm => ({
   role_title: profile.role_title ?? '',
   location: profile.location ?? '',
   linkedin_url: profile.linkedin_url ?? '',
+  github_url: profile.github_url ?? '',
   phone_number: profile.phone_number ?? '',
 })
 
@@ -526,6 +528,7 @@ function ProfileFormCard({
       role_title: profileForm.role_title,
       location: profileForm.location,
       linkedin_url: profileForm.linkedin_url || null,
+      github_url: profileForm.github_url || null,
       phone_number: profileForm.phone_number || null,
     })
 
@@ -644,6 +647,16 @@ function ProfileFormCard({
                 value={profileForm.linkedin_url}
                 onChange={handleProfileChange}
                 placeholder="https://www.linkedin.com/in/your-handle"
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-[13px] text-slate-100 focus:border-indigo-400 focus:outline-none"
+              />
+            </label>
+            <label className="text-xs font-medium text-slate-300">
+              GitHub URL <span className="text-slate-400">(optional)</span>
+              <input
+                name="github_url"
+                value={profileForm.github_url}
+                onChange={handleProfileChange}
+                placeholder="https://github.com/your-handle"
                 className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-[13px] text-slate-100 focus:border-indigo-400 focus:outline-none"
               />
             </label>

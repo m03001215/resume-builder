@@ -30,6 +30,8 @@ import LoadingSpinner from '../components/LoadingSpinner'
 import toast from 'react-hot-toast'
 import { supabase } from '../lib/supabaseClient'
 
+type ResumeLanguage = 'English' | 'Japanese' | 'Chinese'
+
 type WorkHistoryItem = {
   id: string
   company: string
@@ -81,24 +83,40 @@ const monthToLabel = (value?: string) => {
   return date.toLocaleString('en-US', { month: 'short', year: 'numeric' })
 }
 
-const workModeLabel = (value?: WorkHistoryItem['workMode']) => {
+const workModeLabel = (value?: WorkHistoryItem['workMode'], language: ResumeLanguage = 'English') => {
   if (!value) return ''
+  const translations: Record<ResumeLanguage, Record<NonNullable<WorkHistoryItem['workMode']>, string>> = {
+    English: { remote: 'Remote', hybrid: 'Hybrid', onsite: 'Onsite' },
+    Japanese: { remote: 'リモート', hybrid: 'ハイブリッド', onsite: 'オンサイト' },
+    Chinese: { remote: '远程', hybrid: '混合', onsite: '现场' },
+  }
   switch (value) {
     case 'remote':
-      return 'Remote'
+      return translations[language].remote
     case 'hybrid':
-      return 'Hybrid'
+      return translations[language].hybrid
     case 'onsite':
-      return 'Onsite'
+      return translations[language].onsite
     default:
       return ''
   }
 }
 
-const buildCoverLetter = (name: string, role: string, location: string) => {
+const buildCoverLetter = (
+  name: string,
+  role: string,
+  location: string,
+  language: ResumeLanguage = 'English',
+) => {
   const fullName = name.trim() || 'Candidate'
   const headline = role.trim() || 'professional'
   const city = location.trim() || 'your area'
+  if (language === 'Japanese') {
+    return `採用ご担当者様\n\n${fullName}と申します。${city}を拠点に${headline}として、成果に結びつくプロダクト開発や改善に取り組んできました。これまでの経験では、関係者との協働、品質・パフォーマンスの最適化、価値提供のスピード向上などを通じて、継続的な成果創出に貢献してきました。\n\n貴社のポジションにおいても、技術力と推進力を活かして貢献したいと考えております。ご検討のほど、よろしくお願いいたします。\n\n敬具\n${fullName}`
+  }
+  if (language === 'Chinese') {
+    return `您好，招聘团队：\n\n我是${fullName}，目前在${city}工作，担任${headline}。我很高兴向您提交我的简历以供审阅。过往经历中，我专注于交付可衡量的业务成果，与跨职能团队紧密协作，并通过工程实践提升性能、稳定性与交付效率。\n\n期待有机会在贵公司贡献我的经验与能力。感谢您的时间与考虑。\n\n此致\n敬礼\n${fullName}`
+  }
   return `Hello Hiring Team,\n\nI’m ${fullName}, a ${headline} based in ${city}. I’m excited to share my resume for your review. My background includes delivering measurable results, collaborating across teams, and building solutions that drive impact.\n\nI’d love the opportunity to contribute to your organization. Thank you for your time and consideration.\n\nSincerely,\n${fullName}`
 }
 
@@ -133,11 +151,20 @@ const buildInitialDraft = (
   }
 }
 
-const buildMockResume = (prev: ResumeDraft, profile: ReturnType<typeof useAuth>['profile']): ResumeDraft => {
+const buildMockResume = (
+  prev: ResumeDraft,
+  profile: ReturnType<typeof useAuth>['profile'],
+  language: ResumeLanguage,
+): ResumeDraft => {
   const fullName = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ').trim()
   const role = profile?.role_title?.trim() || 'Full Stack Engineer'
   const location = profile?.location?.trim() || 'Remote'
-  const summary = `Full-stack engineer specializing in product delivery, modern web architecture, and scalable APIs. Known for translating ambiguous requirements into reliable releases, improving performance, and mentoring teams while maintaining strong UX, accessibility, and measurable business impact.`
+  const summary =
+    language === 'Japanese'
+      ? `プロダクト開発、モダンなWebアーキテクチャ、スケーラブルなAPIに強みを持つフルスタックエンジニア。曖昧な要件を確実なリリースへ落とし込み、性能改善と品質向上を推進し、チームに知見を還元しながらビジネス成果に貢献。`
+      : language === 'Chinese'
+        ? `全栈工程师，擅长产品交付、现代 Web 架构与可扩展 API。能够将模糊需求落地为稳定上线，通过性能优化与工程实践提升质量与效率，并在跨团队协作中推动可衡量的业务结果。`
+        : `Full-stack engineer specializing in product delivery, modern web architecture, and scalable APIs. Known for translating ambiguous requirements into reliable releases, improving performance, and mentoring teams while maintaining strong UX, accessibility, and measurable business impact.`
   const skills = [
     'React',
     'TypeScript',
@@ -163,7 +190,7 @@ const buildMockResume = (prev: ResumeDraft, profile: ReturnType<typeof useAuth>[
     ...prev,
     summary,
     skills,
-    coverLetter: prev.coverLetter?.trim() || buildCoverLetter(fullName, role, location),
+    coverLetter: prev.coverLetter?.trim() || buildCoverLetter(fullName, role, location, language),
     workHistory: prev.workHistory.map((item) => ({
       ...item,
       bullets: defaultBullets(item.title || 'role', item.company || 'team'),
@@ -195,17 +222,353 @@ const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) 
     .join(' ')
     .trim()
 
+const SECTION_LABELS: Record<
+  ResumeLanguage,
+  { summary: string; skills: string; experience: string; education: string; coverLetter: string }
+> = {
+  English: {
+    summary: 'SUMMARY',
+    skills: 'TECHNICAL SKILLS',
+    experience: 'EXPERIENCE',
+    education: 'EDUCATION',
+    coverLetter: 'COVER LETTER',
+  },
+  Japanese: {
+    summary: '概要',
+    skills: '技術スキル',
+    experience: '職務経歴',
+    education: '学歴',
+    coverLetter: 'カバーレター',
+  },
+  Chinese: {
+    summary: '概要',
+    skills: '技术技能',
+    experience: '工作经历',
+    education: '教育背景',
+    coverLetter: '求职信',
+  },
+}
+
+const getCanvasFontStack = (language: ResumeLanguage) => {
+  switch (language) {
+    case 'Japanese':
+      return `"Yu Gothic","Meiryo","MS PGothic","Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif`
+    case 'Chinese':
+      return `"Microsoft YaHei","PingFang SC","SimSun","Noto Sans SC",sans-serif`
+    default:
+      return `"Arial",sans-serif`
+  }
+}
+
+const wrapTextByMeasure = (args: {
+  text: string
+  measure: (s: string) => number
+  maxWidth: number
+  language: ResumeLanguage
+}) => {
+  const { text, measure, maxWidth, language } = args
+  const trimmed = text ?? ''
+  if (!trimmed) return ['']
+
+  // For CJK, wrap by character; for English, wrap by words/spaces.
+  const parts =
+    language === 'English'
+      ? trimmed.split(/(\s+)/).filter((p) => p.length > 0)
+      : Array.from(trimmed)
+
+  const lines: string[] = []
+  let current = ''
+  for (const part of parts) {
+    const next = current ? current + part : part
+    if (measure(next) <= maxWidth || !current) {
+      current = next
+      continue
+    }
+    lines.push(current.trimEnd())
+    current = part.trimStart()
+  }
+  if (current) lines.push(current.trimEnd())
+  return lines.length > 0 ? lines : ['']
+}
+
+const buildResumePdfBlobRasterized = (args: {
+  profile: ReturnType<typeof useAuth>['profile']
+  draft: ResumeDraft
+  jobTitle: string
+  language: ResumeLanguage
+}) => {
+  const { profile, draft, jobTitle, language } = args
+
+  // Render each PDF page as an image drawn on a canvas using system fonts (Unicode-safe),
+  // then embed the image into a PDF.
+  const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+  const pageWidthPt = pdf.internal.pageSize.getWidth()
+  const pageHeightPt = pdf.internal.pageSize.getHeight()
+  const marginPt = 54
+
+  const scale = 2
+  const pageWidthPx = Math.round(pageWidthPt * scale)
+  const pageHeightPx = Math.round(pageHeightPt * scale)
+  const marginPx = Math.round(marginPt * scale)
+
+  const fontFamily = getCanvasFontStack(language)
+
+  const fullName = buildCandidateFullName(profile) || 'Candidate'
+  const titleLine = profile?.role_title?.trim() || jobTitle.trim()
+  const locationLine = profile?.location?.trim() || ''
+  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .join(' | ')
+
+  const displaySkills =
+    Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0
+      ? draft.skillDisplayLines
+      : draft.skills
+
+  const toRgb = (hex: string) => {
+    const normalized = hex.replace('#', '')
+    const full = normalized.length === 3 ? normalized.split('').map((c) => c + c).join('') : normalized
+    const r = parseInt(full.slice(0, 2), 16)
+    const g = parseInt(full.slice(2, 4), 16)
+    const b = parseInt(full.slice(4, 6), 16)
+    return { r, g, b }
+  }
+  const rgbStr = (hex: string) => {
+    const { r, g, b } = toRgb(hex)
+    return `rgb(${r},${g},${b})`
+  }
+
+  const newPageCanvas = () => {
+    const canvas = document.createElement('canvas')
+    canvas.width = pageWidthPx
+    canvas.height = pageHeightPx
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('Missing canvas context')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.textBaseline = 'alphabetic'
+    ctx.fillStyle = '#111111'
+    return { canvas, ctx }
+  }
+
+  const embedCanvasPage = (canvas: HTMLCanvasElement, isFirst: boolean) => {
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
+    if (!isFirst) pdf.addPage()
+    pdf.addImage(dataUrl, 'JPEG', 0, 0, pageWidthPt, pageHeightPt)
+  }
+
+  let { canvas, ctx } = newPageCanvas()
+  let isFirstPage = true
+  let y = marginPx
+
+  const maxWidthPx = pageWidthPx - marginPx * 2
+
+  const setFont = (sizePt: number, bold = false) => {
+    const sizePx = Math.round(sizePt * scale)
+    ctx.font = `${bold ? '700' : '400'} ${sizePx}px ${fontFamily}`
+  }
+
+  const ensureSpace = (neededPx: number) => {
+    if (y + neededPx <= pageHeightPx - marginPx) return
+    embedCanvasPage(canvas, isFirstPage)
+    isFirstPage = false
+    ;({ canvas, ctx } = newPageCanvas())
+    y = marginPx
+  }
+
+  const drawCentered = (text: string, sizePt: number, bold: boolean, colorHex: string, afterPx: number) => {
+    setFont(sizePt, bold)
+    ctx.fillStyle = rgbStr(colorHex)
+    const lines = wrapTextByMeasure({
+      text,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: maxWidthPx,
+      language,
+    })
+    const lineHeight = Math.round((sizePt * 1.35) * scale)
+    for (const line of lines) {
+      ensureSpace(lineHeight)
+      const w = ctx.measureText(line).width
+      const x = Math.round((pageWidthPx - w) / 2)
+      ctx.fillText(line, x, y)
+      y += lineHeight
+    }
+    y += afterPx
+  }
+
+  const drawDivider = () => {
+    ensureSpace(Math.round(10 * scale))
+    ctx.strokeStyle = '#000000'
+    ctx.lineWidth = Math.round(2.25 * scale)
+    ctx.beginPath()
+    ctx.moveTo(marginPx, y)
+    ctx.lineTo(pageWidthPx - marginPx, y)
+    ctx.stroke()
+    y += Math.round(18 * scale)
+  }
+
+  const drawSectionHeading = (label: string) => {
+    y += Math.round(10 * scale)
+    ensureSpace(Math.round(18 * scale))
+    setFont(10.5, true)
+    ctx.fillStyle = '#111111'
+    ctx.fillText(label, marginPx, y)
+    y += Math.round(6 * scale)
+    ctx.strokeStyle = '#333333'
+    ctx.lineWidth = Math.round(1.5 * scale)
+    ctx.beginPath()
+    ctx.moveTo(marginPx, y)
+    ctx.lineTo(pageWidthPx - marginPx, y)
+    ctx.stroke()
+    y += Math.round(16 * scale)
+  }
+
+  const drawParagraph = (text: string, sizePt: number, colorHex: string, lineHeightPt: number, afterPt: number) => {
+    setFont(sizePt, false)
+    ctx.fillStyle = rgbStr(colorHex)
+    const lineHeightPx = Math.round(lineHeightPt * scale)
+    const lines = wrapTextByMeasure({
+      text,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: maxWidthPx,
+      language,
+    })
+    for (const line of lines) {
+      ensureSpace(lineHeightPx)
+      ctx.fillText(line, marginPx, y)
+      y += lineHeightPx
+    }
+    y += Math.round(afterPt * scale)
+  }
+
+  const drawBullet = (text: string) => {
+    const lineHeightPx = Math.round(16 * scale)
+    setFont(10, false)
+    ctx.fillStyle = '#111111'
+    ensureSpace(lineHeightPx)
+    ctx.fillText('•', marginPx, y)
+    const indentPx = Math.round(12 * scale)
+    const bulletMaxWidthPx = maxWidthPx - indentPx
+    const lines = wrapTextByMeasure({
+      text,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: bulletMaxWidthPx,
+      language,
+    })
+    let first = true
+    for (const line of lines) {
+      if (!first) ensureSpace(lineHeightPx)
+      ctx.fillText(line, marginPx + indentPx, y)
+      y += lineHeightPx
+      first = false
+    }
+    y += Math.round(20 * scale)
+  }
+
+  const drawRightAligned = (text: string, sizePt: number, colorHex: string) => {
+    setFont(sizePt, false)
+    ctx.fillStyle = rgbStr(colorHex)
+    const w = ctx.measureText(text).width
+    const x = pageWidthPx - marginPx - w
+    ctx.fillText(text, x, y)
+  }
+
+  drawCentered(fullName, 19, true, '111111', Math.round(2 * scale))
+  if (titleLine) drawCentered(titleLine, 11.5, true, '333333', 0)
+  if (locationLine) drawCentered(locationLine, 10, false, '555555', 0)
+  if (contactLine) drawCentered(contactLine, 10, false, '555555', 0)
+  drawDivider()
+
+  drawSectionHeading(SECTION_LABELS[language].summary)
+  const summary = (draft.summary || '').trim()
+  if (summary) drawParagraph(summary, 10.5, '111111', 16, 20)
+
+  drawSectionHeading(SECTION_LABELS[language].skills)
+  for (const line of displaySkills.map((s) => s.trim()).filter(Boolean)) drawBullet(line)
+
+  drawSectionHeading(SECTION_LABELS[language].experience)
+  for (const item of draft.workHistory) {
+    const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
+    const locMode = [item.location, workModeLabel(item.workMode, language)].filter(Boolean).join(' | ')
+
+    ensureSpace(Math.round(16 * scale))
+    setFont(10.5, true)
+    ctx.fillStyle = '#111111'
+    const leftTitle = item.title || 'Role'
+    const leftLines = wrapTextByMeasure({
+      text: leftTitle,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: maxWidthPx * 0.62,
+      language,
+    })
+    ctx.fillText(leftLines[0] ?? '', marginPx, y)
+    drawRightAligned(dates, 9.5, '555555')
+    y += Math.round(16 * scale)
+    for (const extra of leftLines.slice(1)) {
+      ensureSpace(Math.round(16 * scale))
+      ctx.fillText(extra, marginPx, y)
+      y += Math.round(16 * scale)
+    }
+    y += Math.round(10 * scale)
+
+    ensureSpace(Math.round(16 * scale))
+    setFont(10.5, false)
+    ctx.fillStyle = '#1f4e79'
+    const company = item.company || 'Company'
+    const companyLines = wrapTextByMeasure({
+      text: company,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: maxWidthPx * 0.62,
+      language,
+    })
+    ctx.fillText(companyLines[0] ?? '', marginPx, y)
+    drawRightAligned(locMode, 9.5, '555555')
+    y += Math.round(16 * scale)
+    for (const extra of companyLines.slice(1)) {
+      ensureSpace(Math.round(16 * scale))
+      ctx.fillText(extra, marginPx, y)
+      y += Math.round(16 * scale)
+    }
+    y += Math.round(12 * scale)
+
+    for (const bullet of (item.bullets ?? []).map((b) => b.trim()).filter(Boolean)) drawBullet(bullet)
+    y += Math.round(18 * scale)
+  }
+
+  drawSectionHeading(SECTION_LABELS[language].education)
+  for (const edu of draft.education) {
+    const degree = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
+    const meta = [
+      [edu.school, edu.location].filter(Boolean).join(' | '),
+      `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+    ]
+      .filter(Boolean)
+      .join(' | ')
+
+    drawParagraph(degree, 10.5, '111111', 16, 4)
+    drawParagraph(meta, 9.5, '555555', 14, 12)
+  }
+
+  embedCanvasPage(canvas, isFirstPage)
+  return pdf.output('blob')
+}
+
 const buildResumePdfBlobDocxStyle = (args: {
   profile: ReturnType<typeof useAuth>['profile']
   draft: ResumeDraft
   companyName: string
   jobTitle: string
+  language: ResumeLanguage
 }) => {
-  const { profile, draft, jobTitle } = args
+  const { profile, draft, jobTitle, language } = args
+  if (language !== 'English') {
+    return buildResumePdfBlobRasterized({ profile, draft, jobTitle, language })
+  }
+
   const fullName = buildCandidateFullName(profile) || 'Candidate'
   const titleLine = profile?.role_title?.trim() || jobTitle.trim()
   const locationLine = profile?.location?.trim() || ''
-  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url]
+  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
 
@@ -222,8 +585,8 @@ const buildResumePdfBlobDocxStyle = (args: {
     sectionHeadingToContent: 16, // gap after underline to first content line
     summaryLineHeight: 16,
     summaryAfter: 20,
-    bulletLineHeight: 16,
-    bulletAfter: 12, // space between bullet points
+    bulletLineHeight: 12,
+    bulletAfter: 16, // space between bullet points
     skillBulletAfter: 14,
     experienceTitleToCompany: 10, // space between title line and company line
     experienceCompanyToBullets: 12, // space between company line and first bullet
@@ -489,7 +852,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   if (contactLine) y = drawCenteredWrapped(contactLine, y, 10, false, '555555')
   y = drawDivider(y)
 
-  y = drawSectionHeading('SUMMARY', y)
+  y = drawSectionHeading(SECTION_LABELS[language].summary, y)
   const summary = (draft.summary || '').trim()
   if (summary) {
     y = drawWrappedTokens({
@@ -506,16 +869,16 @@ const buildResumePdfBlobDocxStyle = (args: {
     y += 10
   }
 
-  y = drawSectionHeading('TECHNICAL SKILLS', y)
+  y = drawSectionHeading(SECTION_LABELS[language].skills, y)
   for (const line of displaySkills.map((s) => s.trim()).filter(Boolean)) {
     y = drawSkillBullet(line, y)
   }
   y += 6
 
-  y = drawSectionHeading('EXPERIENCE', y)
+  y = drawSectionHeading(SECTION_LABELS[language].experience, y)
   for (const item of draft.workHistory) {
     const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
-    const locMode = [item.location, workModeLabel(item.workMode)].filter(Boolean).join(' | ')
+    const locMode = [item.location, workModeLabel(item.workMode, language)].filter(Boolean).join(' | ')
 
     y = drawExperienceLine({
       left: item.title || 'Role',
@@ -546,7 +909,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     y = ensureSpace(y + PDF_SPACING.experienceAfterJob, PDF_SPACING.experienceAfterJob)
   }
 
-  y = drawSectionHeading('EDUCATION', y)
+  y = drawSectionHeading(SECTION_LABELS[language].education, y)
   for (const edu of draft.education) {
     const degree = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
     const meta = [
@@ -584,9 +947,117 @@ const buildResumePdfBlobDocxStyle = (args: {
 const buildCoverLetterPdfBlob = (args: {
   profile: ReturnType<typeof useAuth>['profile']
   draft: ResumeDraft
+  language: ResumeLanguage
 }) => {
-  const { profile, draft } = args
+  const { profile, draft, language } = args
   const fullName = buildCandidateFullName(profile) || 'Candidate'
+
+  if (language !== 'English') {
+    // Rasterized cover letter PDF for CJK (Unicode-safe)
+    const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+    const pageWidthPt = pdf.internal.pageSize.getWidth()
+    const pageHeightPt = pdf.internal.pageSize.getHeight()
+    const marginPt = 54
+    const scale = 2
+    const pageWidthPx = Math.round(pageWidthPt * scale)
+    const pageHeightPx = Math.round(pageHeightPt * scale)
+    const marginPx = Math.round(marginPt * scale)
+    const maxWidthPx = pageWidthPx - marginPx * 2
+    const fontFamily = getCanvasFontStack(language)
+
+    const newCanvas = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = pageWidthPx
+      canvas.height = pageHeightPx
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('Missing canvas context')
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.textBaseline = 'alphabetic'
+      ctx.fillStyle = '#111111'
+      return { canvas, ctx }
+    }
+
+    const embed = (canvas: HTMLCanvasElement, first: boolean) => {
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
+      if (!first) pdf.addPage()
+      pdf.addImage(dataUrl, 'JPEG', 0, 0, pageWidthPt, pageHeightPt)
+    }
+
+    let { canvas, ctx } = newCanvas()
+    let first = true
+    let y = marginPx
+
+    const setFont = (sizePt: number, bold = false) => {
+      const sizePx = Math.round(sizePt * scale)
+      ctx.font = `${bold ? '700' : '400'} ${sizePx}px ${fontFamily}`
+    }
+    const ensureSpace = (neededPx: number) => {
+      if (y + neededPx <= pageHeightPx - marginPx) return
+      embed(canvas, first)
+      first = false
+      ;({ canvas, ctx } = newCanvas())
+      y = marginPx
+    }
+
+    const drawCentered = (text: string, sizePt: number, bold: boolean) => {
+      setFont(sizePt, bold)
+      const lines = wrapTextByMeasure({
+        text,
+        measure: (s) => ctx.measureText(s).width,
+        maxWidth: maxWidthPx,
+        language,
+      })
+      const lineHeight = Math.round((sizePt * 1.35) * scale)
+      for (const line of lines) {
+        ensureSpace(lineHeight)
+        const w = ctx.measureText(line).width
+        const x = Math.round((pageWidthPx - w) / 2)
+        ctx.fillText(line, x, y)
+        y += lineHeight
+      }
+    }
+
+    const drawParagraphs = (text: string) => {
+      setFont(10.5, false)
+      const lineHeight = Math.round(16 * scale)
+      const paragraphs = text.split(/\n{2,}/g).map((p) => p.replace(/\n/g, ' ').trim()).filter(Boolean)
+      for (const p of paragraphs) {
+        const lines = wrapTextByMeasure({
+          text: p,
+          measure: (s) => ctx.measureText(s).width,
+          maxWidth: maxWidthPx,
+          language,
+        })
+        for (const line of lines) {
+          ensureSpace(lineHeight)
+          ctx.fillText(line, marginPx, y)
+          y += lineHeight
+        }
+        y += Math.round(22 * scale)
+      }
+    }
+
+    drawCentered(fullName, 19, true)
+    const coverTitle = language === 'Japanese' ? 'カバーレター' : '求职信'
+    drawCentered(coverTitle, 11.5, true)
+
+    // divider
+    ensureSpace(Math.round(10 * scale))
+    ctx.strokeStyle = '#000000'
+    ctx.lineWidth = Math.round(2.25 * scale)
+    ctx.beginPath()
+    ctx.moveTo(marginPx, y)
+    ctx.lineTo(pageWidthPx - marginPx, y)
+    ctx.stroke()
+    y += Math.round(18 * scale)
+
+    drawParagraphs((draft.coverLetter || '').trim() || (language === 'Japanese' ? '（カバーレター本文がありません）' : '（求职信正文为空）'))
+
+    embed(canvas, first)
+    return pdf.output('blob')
+  }
+
   const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
   const pageWidth = pdf.internal.pageSize.getWidth()
   const pageHeight = pdf.internal.pageSize.getHeight()
@@ -658,6 +1129,15 @@ export default function ResumeBuilder() {
   const [notes, setNotes] = useState('')
   const [companyName, setCompanyName] = useState('')
   const [jobTitle, setJobTitle] = useState('')
+  const [resumeLanguage, setResumeLanguage] = useState<ResumeLanguage>(() => {
+    try {
+      const saved = localStorage.getItem('resume_generator_language')
+      if (saved === 'English' || saved === 'Japanese' || saved === 'Chinese') return saved
+    } catch {
+      // ignore
+    }
+    return 'English'
+  })
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [isSaved, setIsSaved] = useState(false)
@@ -666,6 +1146,16 @@ export default function ResumeBuilder() {
   const [skillInput, setSkillInput] = useState('')
   const [downloadHandle, setDownloadHandle] = useState<FileSystemDirectoryHandle | null>(null)
   const [downloadHandleName, setDownloadHandleName] = useState<string | null>(null)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('resume_generator_language', resumeLanguage)
+    } catch {
+      // ignore
+    }
+  }, [resumeLanguage])
+
+  // (ATS Print-to-PDF export removed; reverted to previous behavior.)
 
   const ensureDirectoryReadWritePermission = async (handle: FileSystemDirectoryHandle) => {
     const anyHandle = handle as unknown as {
@@ -921,6 +1411,7 @@ export default function ResumeBuilder() {
     const careerEndYear = endYears.length > 0 ? Math.max(...endYears) : undefined
     const payload = {
       candidateName: buildCandidateFullName(profile),
+      resumeLanguage,
       careerStartYear,
       careerEndYear,
       summary: draft.summary,
@@ -960,6 +1451,8 @@ export default function ResumeBuilder() {
               )}
 
 INSTRUCTIONS:
+0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
+   - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
 1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
 2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
 3. Do not summarize or paraphrase the job description before processing.
@@ -1250,7 +1743,7 @@ If you understand, return the single JSON object now.`,
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
-      updateDraft((prev) => buildMockResume(prev, profile))
+      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage))
       setHasGenerated(true)
     } finally {
       setIsGenerating(false)
@@ -1341,7 +1834,7 @@ If you understand, return the single JSON object now.`,
     const fullName = buildCandidateFullName(profile)
     const titleLine = profile?.role_title ?? ''
     const locationLine = profile?.location ?? ''
-    const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url]
+    const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
     // Prepare skills for display in DOCX.
@@ -1488,6 +1981,28 @@ If you understand, return the single JSON object now.`,
         spacing: { after: 60 },
       })
     
+    const docxSectionLabels: Record<ResumeLanguage, { summary: string; skills: string; experience: string; education: string }> =
+      {
+        English: {
+          summary: 'SUMMARY',
+          skills: 'TECHNICAL SKILLS',
+          experience: 'EXPERIENCE',
+          education: 'EDUCATION',
+        },
+        Japanese: {
+          summary: '概要',
+          skills: '技術スキル',
+          experience: '職務経歴',
+          education: '学歴',
+        },
+        Chinese: {
+          summary: '概要',
+          skills: '技术技能',
+          experience: '工作经历',
+          education: '教育背景',
+        },
+      }
+
     const doc = new Document({
       styles: {
         default: {
@@ -1589,13 +2104,13 @@ If you understand, return the single JSON object now.`,
               ],
             }),
             new Paragraph({ text: '', spacing: { before: 16, after: 40 } }),
-            sectionHeading('SUMMARY'),
+            sectionHeading(docxSectionLabels[resumeLanguage].summary),
             new Paragraph({
               children: buildHighlightedRuns(draft.summary, 21),
               alignment: AlignmentType.JUSTIFIED,
               spacing: { after: 140 },
             }),
-            sectionHeading('TECHNICAL SKILLS'),
+            sectionHeading(docxSectionLabels[resumeLanguage].skills),
               // Render each skill display line as a full-width bullet (not a multi-column grid)
               // displaySkills contains lines like "Frontend: React, TypeScript" or uncategorized skills
               ...displaySkills.map((line) =>
@@ -1607,7 +2122,7 @@ If you understand, return the single JSON object now.`,
                 }),
               ),
             new Paragraph({ text: '', spacing: { after: 80 } }),
-            sectionHeading('EXPERIENCE'),
+            sectionHeading(docxSectionLabels[resumeLanguage].experience),
             ...draft.workHistory.flatMap((item) => [
               experienceLine(
                 item.title || 'Role',
@@ -1624,7 +2139,7 @@ If you understand, return the single JSON object now.`,
               ...item.bullets.map((bullet) => bulletLine(bullet)),
               new Paragraph({ text: '' }),
             ]),
-            sectionHeading('EDUCATION'),
+            sectionHeading(docxSectionLabels[resumeLanguage].education),
             ...draft.education.map(
               (edu) =>
                 new Paragraph({
@@ -1663,13 +2178,14 @@ If you understand, return the single JSON object now.`,
       draft,
       companyName: companyName || '',
       jobTitle: jobTitle || '',
+      language: resumeLanguage,
     })
     const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
     const roleSlug = sanitizeFilePart(jobTitle || profile?.role_title || '', 'role')
     const companySlug = sanitizeFilePart(companyName || '', 'company')
     const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
     const coverText = draft.coverLetter || ''
-    const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft })
+    const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft, language: resumeLanguage })
 
     const resumeBaseName = sanitizeFileName(
       `${buildCandidateFullName(profile) || 'Candidate'} - ${jobTitle || profile?.role_title || 'Role'}`,
@@ -1770,7 +2286,24 @@ If you understand, return the single JSON object now.`,
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
           <div className="flex items-center justify-between gap-3">
             <h2 className="text-base font-semibold text-white">Generation notes</h2>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/40 px-3 py-2 text-xs font-semibold text-slate-200">
+                <span className="text-slate-300">Language</span>
+                <select
+                  value={resumeLanguage}
+                  onChange={(event) => {
+                    const next = event.target.value as ResumeLanguage
+                    setResumeLanguage(next)
+                    markUnsaved()
+                    setHasGenerated(false)
+                  }}
+                  className="rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-xs text-slate-100 focus:border-indigo-400 focus:outline-none"
+                >
+                  <option value="English">English</option>
+                  <option value="Japanese">Japanese</option>
+                  <option value="Chinese">Chinese</option>
+                </select>
+              </label>
               <button
                 type="button"
                 onClick={handleGenerate}
