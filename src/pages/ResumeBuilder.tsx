@@ -16,13 +16,9 @@ import {
   Document,
   Packer,
   Paragraph,
+  ShadingType,
   TabStopType,
-  Table,
-  TableCell,
-  TableLayoutType,
-  TableRow,
   TextRun,
-  WidthType,
 } from 'docx'
 import jsPDF from 'jspdf'
 import { useAuth } from '../hooks/useAuth'
@@ -32,10 +28,119 @@ import { supabase } from '../lib/supabaseClient'
 
 type ResumeLanguage = 'English' | 'Japanese' | 'Chinese'
 
+type ResumeStyle = 'Classic' | 'Modern' | 'Minimal' | 'Executive' | 'Creative' | 'TrueCircle'
+
+type ResumeStylePreset = {
+  label: string
+  description: string
+  headerAlign: 'center' | 'left'
+  fontFamily: string
+  pdfFontFamily: 'times' | 'helvetica' | 'courier'
+  accentHex: string // 6-char hex without '#'
+  headingStyle: 'underline' | 'bar' | 'shaded' | 'boxed' | 'none'
+  headingUppercase: boolean
+  dividerStyle: 'thick' | 'thin' | 'none'
+  bulletChar: string
+  pdf: {
+    nameSize: number
+    titleSize: number
+    contactSize: number
+    headingSize: number
+    bodySize: number
+  }
+}
+
+const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
+  Classic: {
+    label: 'Classic',
+    description: 'Centered header + clean underlined sections.',
+    headerAlign: 'center',
+    fontFamily: 'Times New Roman',
+    pdfFontFamily: 'times',
+    accentHex: '1f4e79',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thick',
+    bulletChar: '•',
+    pdf: { nameSize: 19, titleSize: 11.5, contactSize: 10, headingSize: 10.5, bodySize: 10.5 },
+  },
+  Modern: {
+    label: 'Modern',
+    description: 'Left-aligned header + clean underlined section lines.',
+    headerAlign: 'left',
+    fontFamily: 'Calibri',
+    pdfFontFamily: 'helvetica',
+    accentHex: '0f766e',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thin',
+    bulletChar: '–',
+    pdf: { nameSize: 20, titleSize: 11, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+  },
+  Minimal: {
+    label: 'Minimal',
+    description: 'Whitespace-first + subtle underlined section lines.',
+    headerAlign: 'left',
+    fontFamily: 'Segoe UI',
+    pdfFontFamily: 'courier',
+    accentHex: '111111',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'none',
+    bulletChar: '•',
+    pdf: { nameSize: 18, titleSize: 10.5, contactSize: 9.5, headingSize: 10, bodySize: 10.5 },
+  },
+  Executive: {
+    label: 'Executive',
+    description: 'ATS-friendly: left header + clean underlined headings.',
+    headerAlign: 'left',
+    fontFamily: 'Georgia',
+    pdfFontFamily: 'times',
+    accentHex: '7c3aed',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thin',
+    bulletChar: '•',
+    pdf: { nameSize: 21, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+  },
+  Creative: {
+    label: 'Creative',
+    description: 'High-contrast accent + underlined section lines.',
+    headerAlign: 'center',
+    fontFamily: 'Trebuchet MS',
+    pdfFontFamily: 'helvetica',
+    accentHex: 'f97316',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thin',
+    // jsPDF built-in fonts may not support glyphs like ◆; use a safe bullet.
+    bulletChar: '•',
+    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 10, headingSize: 10.5, bodySize: 10.5 },
+  },
+  TrueCircle: {
+    label: 'TrueCircle',
+    description: 'ATS-friendly: crisp underlines + calm accent.',
+    headerAlign: 'left',
+    fontFamily: 'Cambria',
+    pdfFontFamily: 'times',
+    accentHex: '2563eb',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thin',
+    bulletChar: '•',
+    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+  },
+}
+
+const getResumeStylePreset = (style: ResumeStyle): ResumeStylePreset =>
+  RESUME_STYLE_PRESETS[style] ?? RESUME_STYLE_PRESETS.Classic
+
 type WorkHistoryItem = {
   id: string
   company: string
   title: string
+  // Optional AI-tailored title for resume output (does not overwrite saved profile title).
+  resume_title?: string
   start: string
   end: string
   workMode?: 'remote' | 'hybrid' | 'onsite' | null
@@ -54,12 +159,16 @@ type EducationItem = {
 }
 
 type ResumeDraft = {
+  // Generated title aligned to target job role (from model output).
+  targetTitle?: string
   summary: string
   skills: string[]
   // Optional display lines for grouped skills like "Frontend: React, Vue"
   skillDisplayLines?: string[]
   workHistory: WorkHistoryItem[]
   education: EducationItem[]
+  keyAchievements: string[]
+  projects: string[]
   coverLetter: string
 }
 
@@ -126,6 +235,7 @@ const buildInitialDraft = (
   educations: ReturnType<typeof useAuth>['educations'],
 ): ResumeDraft => {
   return {
+    targetTitle: '',
     summary: '',
     skills: [],
     workHistory: (companies ?? []).map((company) => ({
@@ -147,6 +257,8 @@ const buildInitialDraft = (
       end: education.is_current ? 'Present' : formatMonth(education.end_date),
       location: education.location ?? '',
     })),
+    keyAchievements: [],
+    projects: [],
     coverLetter: '',
   }
 }
@@ -155,45 +267,169 @@ const buildMockResume = (
   prev: ResumeDraft,
   profile: ReturnType<typeof useAuth>['profile'],
   language: ResumeLanguage,
+  targetJobTitle?: string,
 ): ResumeDraft => {
   const fullName = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ').trim()
-  const role = profile?.role_title?.trim() || 'Full Stack Engineer'
+  const desiredTitle = (targetJobTitle || '').trim()
+  type RoleArchetype =
+    | 'data'
+    | 'ml'
+    | 'devops'
+    | 'security'
+    | 'backend'
+    | 'frontend'
+    | 'mobile'
+    | 'qa'
+    | 'product'
+    | 'generic'
+
+  const inferArchetype = (title: string): RoleArchetype => {
+    const t = title.toLowerCase()
+    if (/(data engineer|analytics engineer|etl|elt|pipeline|warehouse|lakehouse|dbt|airflow|dagster|spark)/.test(t))
+      return 'data'
+    if (/(ml engineer|machine learning|mle|data scientist|ai engineer|llm|nlp|computer vision)/.test(t))
+      return 'ml'
+    if (/(devops|sre|site reliability|platform engineer|infrastructure|kubernetes|terraform)/.test(t))
+      return 'devops'
+    if (/(security|appsec|secops|iam|threat|vulnerability|pentest)/.test(t)) return 'security'
+    if (/(backend|back-end|api|distributed systems|services)/.test(t)) return 'backend'
+    if (/(frontend|front-end|ui engineer|react|web developer)/.test(t)) return 'frontend'
+    if (/(android|ios|mobile)/.test(t)) return 'mobile'
+    if (/(qa|quality|test automation|sdet)/.test(t)) return 'qa'
+    if (/(product manager|product owner|pm\b)/.test(t)) return 'product'
+    return 'generic'
+  }
+
+  const archetype = inferArchetype(desiredTitle)
+  const role = desiredTitle || 'Software Engineer'
   const location = profile?.location?.trim() || 'Remote'
   const summary =
     language === 'Japanese'
-      ? `プロダクト開発、モダンなWebアーキテクチャ、スケーラブルなAPIに強みを持つフルスタックエンジニア。曖昧な要件を確実なリリースへ落とし込み、性能改善と品質向上を推進し、チームに知見を還元しながらビジネス成果に貢献。`
+      ? archetype === 'data'
+        ? `データ基盤の設計・構築、ETL/ELTパイプライン、データモデリングに強みを持つエンジニア。要件をデータ仕様へ落とし込み、品質・信頼性・可観測性を高めながら、分析と意思決定を支えるデータ提供を推進。`
+        : archetype === 'ml'
+          ? `機械学習の実装から運用までを見据えたMLエンジニア。データ準備、特徴量設計、評価・監視、デプロイを通じてモデルの品質と再現性を高め、プロダクト価値につながる改善を推進。`
+          : archetype === 'devops'
+            ? `信頼性と開発生産性を両立するDevOps/SRE志向のエンジニア。インフラ自動化、可観測性、CI/CD、障害対応の仕組み化を通じて、安定稼働とリリース速度を向上。`
+            : archetype === 'security'
+              ? `アプリケーションセキュリティに強みを持つエンジニア。脆弱性対策、IAM、セキュア設計、監査対応を通じて、リスクを低減しながら安全な開発を支援。`
+              : archetype === 'frontend'
+                ? `アクセシビリティとパフォーマンスを重視するフロントエンドエンジニア。設計・実装・改善を通じて、使いやすく高速なUIを安定的に提供。`
+                : archetype === 'backend'
+                  ? `スケーラブルなAPIと分散システムに強みを持つバックエンドエンジニア。パフォーマンス、可用性、観測性を意識した設計で、安定したサービス提供を推進。`
+                  : `プロダクト開発と技術的な課題解決に強みを持つエンジニア。要件を整理し、品質とスピードのバランスを取りながら、継続的な改善で成果に貢献。`
       : language === 'Chinese'
-        ? `全栈工程师，擅长产品交付、现代 Web 架构与可扩展 API。能够将模糊需求落地为稳定上线，通过性能优化与工程实践提升质量与效率，并在跨团队协作中推动可衡量的业务结果。`
+        ? archetype === 'data'
+          ? `数据工程方向工程师，擅长数据平台建设、ETL/ELT 管道、数据建模与数据质量治理。能够将业务需求转化为可靠的数据资产，通过可观测性与自动化提升稳定性与效率，支持分析与数据驱动决策。`
+          : archetype === 'ml'
+            ? `机器学习工程师，关注从数据准备到训练、评估、部署与监控的全流程。通过工程化与可观测性提升模型的稳定性与可复现性，推动业务指标的持续改善。`
+            : archetype === 'devops'
+              ? `DevOps/SRE 方向工程师，专注基础设施自动化、可观测性与 CI/CD。通过标准化与自动化提升稳定性、发布效率与故障响应能力。`
+              : archetype === 'security'
+                ? `安全工程方向工程师，专注应用安全、身份与访问控制、风险治理与合规。推动安全左移，将安全策略融入开发与交付流程，降低整体风险。`
+                : archetype === 'frontend'
+                  ? `前端工程师，重视性能、可访问性与一致的交互体验。通过组件化与工程实践提升交付效率与产品质量。`
+                  : archetype === 'backend'
+                    ? `后端工程师，擅长可扩展 API 与分布式系统。关注性能、稳定性与可观测性，保障服务在高负载下可靠运行。`
+                    : `软件工程师，擅长将需求落地为可维护的系统与功能，通过工程实践提升质量与交付效率，并在协作中推动可衡量的结果。`
         : `Full-stack engineer specializing in product delivery, modern web architecture, and scalable APIs. Known for translating ambiguous requirements into reliable releases, improving performance, and mentoring teams while maintaining strong UX, accessibility, and measurable business impact.`
-  const skills = [
-    'React',
-    'TypeScript',
-    'Node.js',
-    'PostgreSQL',
-    'REST APIs',
-    'GraphQL',
-    'AWS',
-    'CI/CD',
-  ]
-  const defaultBullets = (title: string, company: string) => [
-    `Led end-to-end delivery for ${company} as ${title}, aligning product, design, and engineering to ship reliable features that improved activation, retention, and accessibility while meeting aggressive launch timelines.`,
-    `Designed scalable APIs and data models that reduced latency and error rates, introducing caching, pagination, and observability practices that kept services stable under peak load and rapid growth conditions.`,
-    `Built responsive React interfaces with TypeScript, component libraries, and testing, raising UI quality, performance, and accessibility scores while simplifying maintenance through shared patterns and documentation.`,
-    `Partnered with stakeholders to translate ambiguous requirements into clear milestones, writing technical specs, estimating effort, and managing risks so delivery stayed predictable and aligned with business outcomes.`,
-    `Automated CI/CD pipelines and infrastructure checks to accelerate releases, improve rollback safety, and shorten feedback loops, enabling the team to ship small, frequent improvements with confidence.`,
-    `Implemented security and privacy best practices, including input validation, auth flows, and data governance, ensuring compliance while protecting customer information across internal tools and public-facing experiences.`,
-    `Mentored engineers through code reviews, pairing, and architecture sessions, fostering stronger engineering standards, knowledge sharing, and a culture of ownership and continuous improvement.`,
-    `Tracked impact with analytics dashboards and experiment frameworks, using data to refine features, prioritize backlog items, and communicate results clearly to leadership and cross-functional partners.`,
-  ]
+  const skills: string[] = (() => {
+    switch (archetype) {
+      case 'data':
+        return ['SQL', 'Python', 'ETL/ELT', 'Data Modeling', 'Airflow', 'Spark', 'dbt', 'Snowflake']
+      case 'ml':
+        return ['Python', 'Model Training', 'Feature Engineering', 'Evaluation', 'Deployment', 'Monitoring', 'ML Ops', 'Data Pipelines']
+      case 'devops':
+        return ['CI/CD', 'Kubernetes', 'Terraform', 'Cloud', 'Observability', 'SRE', 'Incident Response', 'Automation']
+      case 'security':
+        return ['AppSec', 'IAM', 'Threat Modeling', 'Vulnerability Management', 'Secure SDLC', 'Logging', 'Compliance', 'OWASP']
+      case 'frontend':
+        return ['React', 'TypeScript', 'Web Performance', 'Accessibility', 'Design Systems', 'Testing', 'State Management', 'CSS']
+      case 'backend':
+        return ['APIs', 'Distributed Systems', 'Databases', 'Caching', 'Observability', 'Performance', 'Security', 'Cloud']
+      default:
+        return ['Communication', 'Problem Solving', 'Ownership', 'Quality', 'Collaboration', 'Delivery', 'Documentation', 'Testing']
+    }
+  })()
+
+  const defaultBullets = (title: string, company: string): string[] => {
+    switch (archetype) {
+      case 'data':
+        return [
+          `Built and maintained ELT/ETL pipelines for ${company} as ${title}, integrating multiple sources into curated models with automated validation to improve data freshness and reliability for analytics consumers.`,
+          `Designed scalable warehouse/lakehouse schemas and data models, standardizing dimensions and facts to reduce query complexity and accelerate dashboard development and self-serve analysis.`,
+          `Implemented orchestration and observability for data workflows, adding lineage, alerting, and retry strategies to cut pipeline failures and shorten time-to-detect for data incidents.`,
+          `Optimized performance and cost across compute and storage, tuning partitions and incremental loads to reduce runtimes and spend while meeting SLAs for critical datasets.`,
+          `Partnered with analysts and stakeholders to translate requirements into data contracts and documentation, ensuring consistent definitions and trusted metrics across reporting surfaces.`,
+          `Hardened data quality and governance with access controls, PII handling, and audit-friendly practices, improving compliance readiness while preserving usability for authorized teams.`,
+        ]
+      case 'ml':
+        return [
+          `Developed and productionized machine learning workflows for ${company} as ${title}, aligning features, training, evaluation, and deployment to deliver measurable improvements in key product metrics.`,
+          `Built reliable data and feature pipelines, adding validation and drift monitoring to improve model stability and reduce regression risk across releases and changing data distributions.`,
+          `Optimized model performance and latency through experimentation and profiling, balancing accuracy, throughput, and cost constraints to meet service-level targets.`,
+          `Implemented monitoring and alerting for model quality and infrastructure, shortening time-to-detect for degraded predictions and enabling fast rollback and mitigation.`,
+          `Partnered with stakeholders to define success metrics and offline/online evaluation, ensuring model outcomes matched business goals and were interpretable for decision-makers.`,
+          `Documented model assumptions, limitations, and governance controls, improving reproducibility, compliance readiness, and cross-team collaboration during reviews.`,
+        ]
+      case 'devops':
+        return [
+          `Automated infrastructure provisioning for ${company} as ${title} using IaC, standardizing environments to reduce drift and speed up secure, repeatable deployments.`,
+          `Built CI/CD pipelines with quality gates and rollbacks, improving release frequency while reducing failure rates and mean time to recovery during incidents.`,
+          `Implemented observability with metrics, logs, and tracing, enabling faster root-cause analysis and tighter SLO/SLA tracking for critical services.`,
+          `Improved reliability through capacity planning and performance testing, mitigating bottlenecks and scaling risks under peak traffic conditions.`,
+          `Established incident response runbooks and on-call practices, strengthening operational readiness and reducing customer impact during outages.`,
+          `Partnered with engineering teams to improve service hardening (timeouts, retries, rate limits), reducing cascading failures and improving overall system resilience.`,
+        ]
+      case 'security':
+        return [
+          `Drove application security improvements for ${company} as ${title}, integrating security checks into CI/CD to reduce vulnerable releases and accelerate remediation.`,
+          `Implemented secure authentication/authorization patterns and least-privilege access controls, reducing exposure while maintaining usability for internal and external users.`,
+          `Performed threat modeling and design reviews, identifying high-risk flows early and guiding mitigations that improved security posture without blocking delivery.`,
+          `Built vulnerability management workflows and SLAs, improving triage quality and reducing time-to-fix for critical issues across teams.`,
+          `Enhanced logging and auditability, enabling better detection, forensics, and compliance evidence for security and privacy requirements.`,
+          `Partnered with stakeholders to translate policy into engineering standards, aligning secure SDLC practices with product timelines and business needs.`,
+        ]
+      case 'frontend':
+        return [
+          `Built and shipped accessible, performant UI features for ${company} as ${title}, improving usability and responsiveness while maintaining consistent design-system patterns.`,
+          `Optimized rendering and bundle performance, reducing load times and improving Core Web Vitals through code-splitting, memoization, and profiling-driven fixes.`,
+          `Implemented robust state management and data fetching patterns, reducing UI bugs and improving maintainability across complex user flows.`,
+          `Hardened quality with component and E2E testing, increasing confidence in releases and reducing regressions across browsers and devices.`,
+          `Partnered with design and product to refine UX and interaction details, aligning implementation with user research and measurable engagement outcomes.`,
+          `Improved accessibility and internationalization support, ensuring inclusive experiences and consistent behavior across locales and assistive technologies.`,
+        ]
+      case 'backend':
+        return [
+          `Designed and delivered scalable API services for ${company} as ${title}, improving reliability and throughput while meeting performance and availability targets.`,
+          `Optimized database access patterns and caching strategies, reducing latency and error rates through indexing, query tuning, and safe rollout practices.`,
+          `Implemented observability and defensive engineering (timeouts, retries, circuit breakers), improving incident detectability and reducing customer-impacting failures.`,
+          `Built secure authentication/authorization flows and data validation, reducing risk while preserving developer ergonomics and API consistency.`,
+          `Collaborated with cross-functional teams to translate requirements into milestones, delivering predictable releases aligned with business outcomes.`,
+          `Improved CI/CD and release safety with automated tests and canary strategies, reducing regressions and speeding up iteration cycles.`,
+        ]
+      default:
+        return [
+          `Led end-to-end delivery for ${company} as ${title}, aligning stakeholders to ship reliable improvements that supported measurable business outcomes and improved user experience.`,
+          `Translated ambiguous requirements into clear technical plans, balancing scope, quality, and timelines to maintain predictable delivery and high team velocity.`,
+          `Improved system performance and reliability by identifying bottlenecks, adding monitoring, and implementing optimizations that reduced errors and improved customer satisfaction.`,
+          `Built maintainable components and shared patterns, reducing duplication and simplifying onboarding while keeping code quality high through reviews and testing.`,
+          `Automated repetitive workflows and introduced tooling, shortening feedback loops and reducing operational overhead while improving developer productivity.`,
+          `Mentored teammates and facilitated cross-team collaboration, raising engineering standards and improving outcomes across multiple workstreams.`,
+        ]
+    }
+  }
 
   return {
     ...prev,
+    targetTitle: role,
     summary,
     skills,
     coverLetter: prev.coverLetter?.trim() || buildCoverLetter(fullName, role, location, language),
     workHistory: prev.workHistory.map((item) => ({
       ...item,
-      bullets: defaultBullets(item.title || 'role', item.company || 'team'),
+      resume_title: role,
+      bullets: defaultBullets(role || 'role', item.company || 'team'),
     })),
   }
 }
@@ -222,15 +458,50 @@ const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) 
     .join(' ')
     .trim()
 
+const normalizeSkillsForDisplay = (skills: string[]) => {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const raw of skills ?? []) {
+    const trimmed = (raw ?? '').trim()
+    if (!trimmed) continue
+
+    const idx = trimmed.indexOf(':')
+    const withoutCategory = idx >= 0 ? (trimmed.slice(idx + 1).trim() || trimmed) : trimmed
+    const parts = withoutCategory
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean)
+    const finalParts = parts.length > 0 ? parts : [withoutCategory]
+
+    for (const p of finalParts) {
+      const key = p.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(p)
+    }
+  }
+  return out
+}
+
 const SECTION_LABELS: Record<
   ResumeLanguage,
-  { summary: string; skills: string; experience: string; education: string; coverLetter: string }
+  {
+    summary: string
+    skills: string
+    experience: string
+    education: string
+    achievements: string
+    projects: string
+    coverLetter: string
+  }
 > = {
   English: {
     summary: 'SUMMARY',
     skills: 'TECHNICAL SKILLS',
     experience: 'EXPERIENCE',
     education: 'EDUCATION',
+    achievements: 'KEY ACHIEVEMENTS',
+    projects: 'PROJECTS',
     coverLetter: 'COVER LETTER',
   },
   Japanese: {
@@ -238,6 +509,8 @@ const SECTION_LABELS: Record<
     skills: '技術スキル',
     experience: '職務経歴',
     education: '学歴',
+    achievements: '主な実績',
+    projects: 'プロジェクト',
     coverLetter: 'カバーレター',
   },
   Chinese: {
@@ -245,18 +518,43 @@ const SECTION_LABELS: Record<
     skills: '技术技能',
     experience: '工作经历',
     education: '教育背景',
+    achievements: '关键成果',
+    projects: '项目',
     coverLetter: '求职信',
   },
 }
 
-const getCanvasFontStack = (language: ResumeLanguage) => {
+const getCanvasFontStack = (language: ResumeLanguage, preferred?: string) => {
+  const pref = (preferred ?? '').trim()
+  const quotedPref = pref ? `"${pref.replace(/"/g, '')}"` : null
   switch (language) {
     case 'Japanese':
-      return `"Yu Gothic","Meiryo","MS PGothic","Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif`
+      return [
+        quotedPref,
+        `"Yu Gothic"`,
+        `"Meiryo"`,
+        `"MS PGothic"`,
+        `"Hiragino Kaku Gothic ProN"`,
+        `"Noto Sans JP"`,
+        'sans-serif',
+      ]
+        .filter(Boolean)
+        .join(',')
     case 'Chinese':
-      return `"Microsoft YaHei","PingFang SC","SimSun","Noto Sans SC",sans-serif`
+      return [
+        quotedPref,
+        `"Microsoft YaHei"`,
+        `"PingFang SC"`,
+        `"SimSun"`,
+        `"Noto Sans SC"`,
+        'sans-serif',
+      ]
+        .filter(Boolean)
+        .join(',')
     default:
-      return `"Arial",sans-serif`
+      return [quotedPref, `"Segoe UI"`, `"Calibri"`, `"Times New Roman"`, 'sans-serif']
+        .filter(Boolean)
+        .join(',')
   }
 }
 
@@ -296,8 +594,10 @@ const buildResumePdfBlobRasterized = (args: {
   draft: ResumeDraft
   jobTitle: string
   language: ResumeLanguage
+  style: ResumeStyle
 }) => {
-  const { profile, draft, jobTitle, language } = args
+  const { profile, draft, jobTitle, language, style } = args
+  const preset = getResumeStylePreset(style)
 
   // Render each PDF page as an image drawn on a canvas using system fonts (Unicode-safe),
   // then embed the image into a PDF.
@@ -311,19 +611,16 @@ const buildResumePdfBlobRasterized = (args: {
   const pageHeightPx = Math.round(pageHeightPt * scale)
   const marginPx = Math.round(marginPt * scale)
 
-  const fontFamily = getCanvasFontStack(language)
+  const fontFamily = getCanvasFontStack(language, preset.fontFamily)
 
   const fullName = buildCandidateFullName(profile) || 'Candidate'
-  const titleLine = profile?.role_title?.trim() || jobTitle.trim()
+  const titleLine = jobTitle.trim()
   const locationLine = profile?.location?.trim() || ''
   const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
 
-  const displaySkills =
-    Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0
-      ? draft.skillDisplayLines
-      : draft.skills
+  const displaySkills = normalizeSkillsForDisplay(draft.skills)
 
   const toRgb = (hex: string) => {
     const normalized = hex.replace('#', '')
@@ -376,7 +673,7 @@ const buildResumePdfBlobRasterized = (args: {
     y = marginPx
   }
 
-  const drawCentered = (text: string, sizePt: number, bold: boolean, colorHex: string, afterPx: number) => {
+  const drawHeader = (text: string, sizePt: number, bold: boolean, colorHex: string, afterPx: number) => {
     setFont(sizePt, bold)
     ctx.fillStyle = rgbStr(colorHex)
     const lines = wrapTextByMeasure({
@@ -389,7 +686,10 @@ const buildResumePdfBlobRasterized = (args: {
     for (const line of lines) {
       ensureSpace(lineHeight)
       const w = ctx.measureText(line).width
-      const x = Math.round((pageWidthPx - w) / 2)
+      const x =
+        preset.headerAlign === 'center'
+          ? Math.round((pageWidthPx - w) / 2)
+          : marginPx
       ctx.fillText(line, x, y)
       y += lineHeight
     }
@@ -397,9 +697,10 @@ const buildResumePdfBlobRasterized = (args: {
   }
 
   const drawDivider = () => {
+    if (preset.dividerStyle === 'none') return
     ensureSpace(Math.round(10 * scale))
-    ctx.strokeStyle = '#000000'
-    ctx.lineWidth = Math.round(2.25 * scale)
+    ctx.strokeStyle = rgbStr(preset.accentHex)
+    ctx.lineWidth = Math.round((preset.dividerStyle === 'thick' ? 2.25 : 1.25) * scale)
     ctx.beginPath()
     ctx.moveTo(marginPx, y)
     ctx.lineTo(pageWidthPx - marginPx, y)
@@ -408,19 +709,63 @@ const buildResumePdfBlobRasterized = (args: {
   }
 
   const drawSectionHeading = (label: string) => {
+    const text = preset.headingUppercase ? label.toUpperCase() : label
     y += Math.round(10 * scale)
     ensureSpace(Math.round(18 * scale))
-    setFont(10.5, true)
-    ctx.fillStyle = '#111111'
-    ctx.fillText(label, marginPx, y)
-    y += Math.round(6 * scale)
-    ctx.strokeStyle = '#333333'
-    ctx.lineWidth = Math.round(1.5 * scale)
-    ctx.beginPath()
-    ctx.moveTo(marginPx, y)
-    ctx.lineTo(pageWidthPx - marginPx, y)
-    ctx.stroke()
-    y += Math.round(16 * scale)
+    setFont(preset.pdf.headingSize, true)
+
+    if (preset.headingStyle === 'shaded') {
+      const h = Math.round(18 * scale)
+      ensureSpace(h)
+      ctx.fillStyle = 'rgb(238,238,238)'
+      ctx.fillRect(marginPx, y - Math.round(13 * scale), pageWidthPx - marginPx * 2, h)
+      ctx.fillStyle = rgbStr('111111')
+      ctx.fillText(text, marginPx + Math.round(8 * scale), y)
+      y += Math.round(16 * scale)
+      return
+    }
+
+    if (preset.headingStyle === 'boxed') {
+      const paddingX = Math.round(8 * scale)
+      const paddingY = Math.round(5 * scale)
+      const w = ctx.measureText(text).width
+      const boxW = Math.min(pageWidthPx - marginPx * 2, w + paddingX * 2)
+      const boxH = Math.round(18 * scale)
+      ensureSpace(boxH)
+      ctx.fillStyle = rgbStr(preset.accentHex)
+      ctx.fillRect(marginPx, y - Math.round(13 * scale) - paddingY, boxW, boxH + paddingY)
+      ctx.fillStyle = '#ffffff'
+      ctx.fillText(text, marginPx + paddingX, y)
+      y += Math.round(18 * scale)
+      return
+    }
+
+    if (preset.headingStyle === 'bar') {
+      const barW = Math.round(4 * scale)
+      const barH = Math.round(16 * scale)
+      ctx.fillStyle = rgbStr(preset.accentHex)
+      ctx.fillRect(marginPx, y - Math.round(12 * scale), barW, barH)
+      ctx.fillStyle = rgbStr('111111')
+      ctx.fillText(text, marginPx + Math.round(10 * scale), y)
+      y += Math.round(18 * scale)
+      return
+    }
+
+    // underline / none
+    ctx.fillStyle = rgbStr('111111')
+    ctx.fillText(text, marginPx, y)
+    if (preset.headingStyle === 'underline') {
+      y += Math.round(6 * scale)
+      ctx.strokeStyle = rgbStr(preset.accentHex)
+      ctx.lineWidth = Math.round(1.5 * scale)
+      ctx.beginPath()
+      ctx.moveTo(marginPx, y)
+      ctx.lineTo(pageWidthPx - marginPx, y)
+      ctx.stroke()
+      y += Math.round(16 * scale)
+    } else {
+      y += Math.round(16 * scale)
+    }
   }
 
   const drawParagraph = (text: string, sizePt: number, colorHex: string, lineHeightPt: number, afterPt: number) => {
@@ -446,7 +791,7 @@ const buildResumePdfBlobRasterized = (args: {
     setFont(10, false)
     ctx.fillStyle = '#111111'
     ensureSpace(lineHeightPx)
-    ctx.fillText('•', marginPx, y)
+    ctx.fillText(preset.bulletChar, marginPx, y)
     const indentPx = Math.round(12 * scale)
     const bulletMaxWidthPx = maxWidthPx - indentPx
     const lines = wrapTextByMeasure({
@@ -473,10 +818,10 @@ const buildResumePdfBlobRasterized = (args: {
     ctx.fillText(text, x, y)
   }
 
-  drawCentered(fullName, 19, true, '111111', Math.round(2 * scale))
-  if (titleLine) drawCentered(titleLine, 11.5, true, '333333', 0)
-  if (locationLine) drawCentered(locationLine, 10, false, '555555', 0)
-  if (contactLine) drawCentered(contactLine, 10, false, '555555', 0)
+  drawHeader(fullName, preset.pdf.nameSize, true, '111111', Math.round(2 * scale))
+  if (titleLine) drawHeader(titleLine, preset.pdf.titleSize, true, '333333', 0)
+  if (locationLine) drawHeader(locationLine, preset.pdf.contactSize, false, '555555', 0)
+  if (contactLine) drawHeader(contactLine, preset.pdf.contactSize, false, '555555', 0)
   drawDivider()
 
   drawSectionHeading(SECTION_LABELS[language].summary)
@@ -484,7 +829,8 @@ const buildResumePdfBlobRasterized = (args: {
   if (summary) drawParagraph(summary, 10.5, '111111', 16, 20)
 
   drawSectionHeading(SECTION_LABELS[language].skills)
-  for (const line of displaySkills.map((s) => s.trim()).filter(Boolean)) drawBullet(line)
+  const skillsText = displaySkills.map((s) => s.trim()).filter(Boolean).join(' • ')
+  if (skillsText) drawParagraph(skillsText, 10.5, '111111', 16, 20)
 
   drawSectionHeading(SECTION_LABELS[language].experience)
   for (const item of draft.workHistory) {
@@ -494,7 +840,7 @@ const buildResumePdfBlobRasterized = (args: {
     ensureSpace(Math.round(16 * scale))
     setFont(10.5, true)
     ctx.fillStyle = '#111111'
-    const leftTitle = item.title || 'Role'
+    const leftTitle = item.resume_title || 'Role'
     const leftLines = wrapTextByMeasure({
       text: leftTitle,
       measure: (s) => ctx.measureText(s).width,
@@ -559,21 +905,22 @@ const buildResumePdfBlobDocxStyle = (args: {
   companyName: string
   jobTitle: string
   language: ResumeLanguage
+  style: ResumeStyle
 }) => {
-  const { profile, draft, jobTitle, language } = args
+  const { profile, draft, jobTitle, language, style } = args
+  const preset = getResumeStylePreset(style)
   if (language !== 'English') {
-    return buildResumePdfBlobRasterized({ profile, draft, jobTitle, language })
+    return buildResumePdfBlobRasterized({ profile, draft, jobTitle, language, style })
   }
 
   const fullName = buildCandidateFullName(profile) || 'Candidate'
-  const titleLine = profile?.role_title?.trim() || jobTitle.trim()
+  const titleLine = jobTitle.trim()
   const locationLine = profile?.location?.trim() || ''
   const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
 
-  // Uses built-in PDF fonts (Helvetica); DOCX uses Arial.
-  // We match DOCX sizes, spacing, alignment, and colors as closely as possible.
+  // Uses jsPDF built-in PDF fonts. We pick font per resume style.
   const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
   const pageWidth = pdf.internal.pageSize.getWidth()
   const pageHeight = pdf.internal.pageSize.getHeight()
@@ -618,35 +965,9 @@ const buildResumePdfBlobDocxStyle = (args: {
   const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
   // Keyword highlighting logic matches DOCX generator.
-  let displaySkills: string[]
-  let flatKeywords: string[]
-  if (Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0) {
-    displaySkills = draft.skillDisplayLines
-    flatKeywords = draft.skillDisplayLines
-      .map((line) => line.split(':').slice(1).join(':'))
-      .map((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
-      .flat()
-  } else {
-    const rawSkills = draft.skills.map((s) => s.trim()).filter(Boolean)
-    const categoryMap: Record<string, string[]> = {}
-    const uncategorized: string[] = []
-    for (const s of rawSkills) {
-      const parts = s.split(':').map((p) => p.trim()).filter(Boolean)
-      if (parts.length >= 2) {
-        const category = parts[0]
-        const item = parts.slice(1).join(':')
-        categoryMap[category] = categoryMap[category] ?? []
-        if (!categoryMap[category].includes(item)) categoryMap[category].push(item)
-      } else {
-        if (!uncategorized.includes(s)) uncategorized.push(s)
-      }
-    }
-    displaySkills = [
-      ...Object.keys(categoryMap).map((cat) => `${cat}: ${categoryMap[cat].join(', ')}`),
-      ...uncategorized,
-    ]
-    flatKeywords = Array.from(new Set(rawSkills.concat(...Object.values(categoryMap))))
-  }
+  // Skills are a flat list (no categories).
+  const displaySkills = normalizeSkillsForDisplay(draft.skills)
+  const flatKeywords = Array.from(new Set(displaySkills))
 
   const extraTokens = flatKeywords
     .map((k) => k.split(/[\s,/\-()]+/).map((t) => t.trim()).filter(Boolean))
@@ -660,6 +981,8 @@ const buildResumePdfBlobDocxStyle = (args: {
 
   type Token = { text: string; bold: boolean }
 
+  const pdfFontFamily = preset.pdfFontFamily
+
   const buildHighlightedTokens = (text: string): Token[] => {
     if (!text) return [{ text, bold: false }]
     if (keywordList.length === 0) return [{ text, bold: false }]
@@ -668,17 +991,6 @@ const buildResumePdfBlobDocxStyle = (args: {
       .split(pattern)
       .filter((chunk) => chunk.length > 0)
       .map((chunk) => ({ text: chunk, bold: keywordLower.has(chunk.toLowerCase()) }))
-  }
-
-  const buildSkillTokens = (text: string): Token[] => {
-    const idx = text.indexOf(':')
-    if (idx === -1) return [{ text, bold: false }]
-    const prefix = text.slice(0, idx + 1) + ' '
-    const rest = text.slice(idx + 1).trim()
-    return [
-      { text: prefix, bold: true },
-      { text: rest, bold: false },
-    ]
   }
 
   const expandWhitespace = (tokens: Token[]) => {
@@ -691,7 +1003,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   }
 
   const measure = (text: string, size: number, bold: boolean) => {
-    pdf.setFont('helvetica', bold ? 'bold' : 'normal')
+    pdf.setFont(pdfFontFamily, bold ? 'bold' : 'normal')
     pdf.setFontSize(size)
     return pdf.getTextWidth(text)
   }
@@ -718,7 +1030,7 @@ const buildResumePdfBlobDocxStyle = (args: {
         y = ensureSpace(y + opts.lineHeight, opts.lineHeight)
         x = opts.x
       }
-      pdf.setFont('helvetica', token.bold ? 'bold' : 'normal')
+      pdf.setFont(pdfFontFamily, token.bold ? 'bold' : 'normal')
       pdf.setFontSize(opts.fontSize)
       pdf.text(token.text, x, y)
       x += w
@@ -726,23 +1038,29 @@ const buildResumePdfBlobDocxStyle = (args: {
     return y
   }
 
-  const drawCenteredWrapped = (text: string, y: number, size: number, bold: boolean, colorHex: string) => {
-    pdf.setFont('helvetica', bold ? 'bold' : 'normal')
+  const drawHeaderWrapped = (text: string, y: number, size: number, bold: boolean, colorHex: string) => {
+    pdf.setFont(pdfFontFamily, bold ? 'bold' : 'normal')
     pdf.setFontSize(size)
     setTextColorHex(colorHex)
     const lines = pdf.splitTextToSize(text, maxWidth) as string[]
     for (const line of lines) {
       y = ensureSpace(y, size + 6)
-      pdf.text(line, pageWidth / 2, y, { align: 'center' })
+      if (preset.headerAlign === 'center') {
+        pdf.text(line, pageWidth / 2, y, { align: 'center' })
+      } else {
+        pdf.text(line, margin, y)
+      }
       y += size + 4
     }
     return y
   }
 
   const drawDivider = (y: number) => {
+    if (preset.dividerStyle === 'none') return y
     y = ensureSpace(y, 10)
-    pdf.setDrawColor(0, 0, 0)
-    pdf.setLineWidth(2.25) // matches DOCX table border thickness
+    const { r, g, b } = hexToRgb(preset.accentHex)
+    pdf.setDrawColor(r, g, b)
+    pdf.setLineWidth(preset.dividerStyle === 'thick' ? 2.25 : 1.25)
     pdf.line(margin, y, pageWidth - margin, y)
     pdf.setLineWidth(1)
     return y + 18
@@ -750,17 +1068,54 @@ const buildResumePdfBlobDocxStyle = (args: {
 
   const drawSectionHeading = (label: string, y: number) => {
     y = ensureSpace(y + 10, 18) // before: 10pt
-    pdf.setFont('helvetica', 'bold')
-    pdf.setFontSize(10.5) // 21 half-points
+    pdf.setFont(pdfFontFamily, 'bold')
+    pdf.setFontSize(preset.pdf.headingSize)
+    const text = preset.headingUppercase ? label.toUpperCase() : label
+
+    if (preset.headingStyle === 'shaded') {
+      const fill = { r: 238, g: 238, b: 238 }
+      pdf.setFillColor(fill.r, fill.g, fill.b)
+      pdf.rect(margin, y - 12, maxWidth, 18, 'F')
+      setTextColorHex('111111')
+      pdf.text(text, margin + 8, y)
+      return y + 22
+    }
+
+    if (preset.headingStyle === 'boxed') {
+      const { r, g, b } = hexToRgb(preset.accentHex)
+      pdf.setFillColor(r, g, b)
+      // keep it as a compact box starting at margin
+      const w = Math.min(maxWidth, pdf.getTextWidth(text) + 16)
+      pdf.rect(margin, y - 12, w, 18, 'F')
+      pdf.setTextColor(255, 255, 255)
+      pdf.text(text, margin + 8, y)
+      setTextColorHex('111111')
+      return y + 22
+    }
+
+    if (preset.headingStyle === 'bar') {
+      const { r, g, b } = hexToRgb(preset.accentHex)
+      pdf.setFillColor(r, g, b)
+      pdf.rect(margin, y - 12, 4, 16, 'F')
+      setTextColorHex('111111')
+      pdf.text(text, margin + 10, y)
+      return y + 22
+    }
+
+    // underline / none
     setTextColorHex('111111')
-    pdf.text(label, margin, y)
-    y += 6
-    const { r, g, b } = hexToRgb('333333')
-    pdf.setDrawColor(r, g, b)
-    pdf.setLineWidth(1.5) // DOCX border size 12
-    pdf.line(margin, y, pageWidth - margin, y)
-    pdf.setLineWidth(1)
-    return y + PDF_SPACING.sectionHeadingToContent
+    pdf.text(text, margin, y)
+    if (preset.headingStyle === 'underline') {
+      y += 6
+      const { r, g, b } = hexToRgb(preset.accentHex)
+      pdf.setDrawColor(r, g, b)
+      pdf.setLineWidth(1.5)
+      pdf.line(margin, y, pageWidth - margin, y)
+      pdf.setLineWidth(1)
+      return y + PDF_SPACING.sectionHeadingToContent
+    }
+
+    return y + 16
   }
 
   const drawExperienceLine = (opts: {
@@ -775,20 +1130,20 @@ const buildResumePdfBlobDocxStyle = (args: {
     let y = ensureSpace(opts.y, 16)
 
     // reserve space for right column to avoid overlap
-    pdf.setFont('helvetica', 'normal')
+    pdf.setFont(pdfFontFamily, 'normal')
     pdf.setFontSize(opts.rightSize)
     setTextColorHex('555555')
     const rightWidth = opts.right ? pdf.getTextWidth(opts.right) : 0
     const leftMax = Math.max(120, maxWidth - rightWidth - 12)
     const leftLines = pdf.splitTextToSize(opts.left, leftMax) as string[]
 
-    pdf.setFont('helvetica', opts.boldLeft ? 'bold' : 'normal')
+    pdf.setFont(pdfFontFamily, opts.boldLeft ? 'bold' : 'normal')
     pdf.setFontSize(opts.leftSize)
     setTextColorHex(opts.leftColorHex)
     pdf.text(leftLines[0] || '', margin, y)
 
     if (opts.right) {
-      pdf.setFont('helvetica', 'normal')
+      pdf.setFont(pdfFontFamily, 'normal')
       pdf.setFontSize(opts.rightSize)
       setTextColorHex('555555')
       pdf.text(opts.right, pageWidth - margin, y, { align: 'right' })
@@ -796,7 +1151,7 @@ const buildResumePdfBlobDocxStyle = (args: {
 
     for (const line of leftLines.slice(1)) {
       y = ensureSpace(y + 14, 14)
-      pdf.setFont('helvetica', opts.boldLeft ? 'bold' : 'normal')
+      pdf.setFont(pdfFontFamily, opts.boldLeft ? 'bold' : 'normal')
       pdf.setFontSize(opts.leftSize)
       setTextColorHex(opts.leftColorHex)
       pdf.text(line, margin, y)
@@ -808,10 +1163,10 @@ const buildResumePdfBlobDocxStyle = (args: {
   const drawBullet = (text: string, y: number) => {
     const lineHeight = PDF_SPACING.bulletLineHeight
     y = ensureSpace(y, lineHeight)
-    pdf.setFont('helvetica', 'normal')
+    pdf.setFont(pdfFontFamily, 'normal')
     pdf.setFontSize(10) // 20 half-points
     setTextColorHex('111111')
-    pdf.text('•', margin, y)
+    pdf.text(preset.bulletChar, margin, y)
     y = drawWrappedTokens({
       tokens: buildHighlightedTokens(text),
       x: margin + 12,
@@ -824,32 +1179,13 @@ const buildResumePdfBlobDocxStyle = (args: {
     return y + PDF_SPACING.bulletAfter
   }
 
-  const drawSkillBullet = (text: string, y: number) => {
-    const lineHeight = PDF_SPACING.bulletLineHeight
-    y = ensureSpace(y, lineHeight)
-    pdf.setFont('helvetica', 'normal')
-    pdf.setFontSize(10)
-    setTextColorHex('111111')
-    pdf.text('•', margin, y)
-    y = drawWrappedTokens({
-      tokens: buildSkillTokens(text),
-      x: margin + 12,
-      y,
-      maxWidth: maxWidth - 12,
-      fontSize: 10,
-      lineHeight,
-      colorHex: '111111',
-    })
-    return y + PDF_SPACING.skillBulletAfter
-  }
-
   // --- Render (mirrors DOCX order/labels) ---
   let y = margin
-  y = drawCenteredWrapped(fullName, y, 19, true, '111111')
+  y = drawHeaderWrapped(fullName, y, preset.pdf.nameSize, true, '111111')
   y += 2
-  if (titleLine) y = drawCenteredWrapped(titleLine, y, 11.5, true, '333333')
-  if (locationLine) y = drawCenteredWrapped(locationLine, y, 10, false, '555555')
-  if (contactLine) y = drawCenteredWrapped(contactLine, y, 10, false, '555555')
+  if (titleLine) y = drawHeaderWrapped(titleLine, y, preset.pdf.titleSize, true, '333333')
+  if (locationLine) y = drawHeaderWrapped(locationLine, y, preset.pdf.contactSize, false, '555555')
+  if (contactLine) y = drawHeaderWrapped(contactLine, y, preset.pdf.contactSize, false, '555555')
   y = drawDivider(y)
 
   y = drawSectionHeading(SECTION_LABELS[language].summary, y)
@@ -870,18 +1206,31 @@ const buildResumePdfBlobDocxStyle = (args: {
   }
 
   y = drawSectionHeading(SECTION_LABELS[language].skills, y)
-  for (const line of displaySkills.map((s) => s.trim()).filter(Boolean)) {
-    y = drawSkillBullet(line, y)
+  const skillsText = displaySkills.map((s) => s.trim()).filter(Boolean).join(' • ')
+  if (skillsText) {
+    y = drawWrappedTokens({
+      // Skills should be plain (no keyword bolding).
+      tokens: [{ text: skillsText, bold: false }],
+      x: margin,
+      y,
+      maxWidth,
+      fontSize: 10,
+      lineHeight: 14,
+      colorHex: '111111',
+    })
+    y += 16
+  } else {
+    y += 10
   }
-  y += 6
 
   y = drawSectionHeading(SECTION_LABELS[language].experience, y)
   for (const item of draft.workHistory) {
+    const titleForResume = item.resume_title
     const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
     const locMode = [item.location, workModeLabel(item.workMode, language)].filter(Boolean).join(' | ')
 
     y = drawExperienceLine({
-      left: item.title || 'Role',
+      left: titleForResume || 'Role',
       right: dates,
       y,
       boldLeft: true,
@@ -920,7 +1269,7 @@ const buildResumePdfBlobDocxStyle = (args: {
       .join(' | ')
 
     y = ensureSpace(y, 16)
-    pdf.setFont('helvetica', 'bold')
+    pdf.setFont(pdfFontFamily, 'bold')
     pdf.setFontSize(10.5)
     setTextColorHex('111111')
     for (const line of (pdf.splitTextToSize(degree || ' ', maxWidth) as string[])) {
@@ -929,7 +1278,7 @@ const buildResumePdfBlobDocxStyle = (args: {
       y += PDF_SPACING.educationLineHeight
     }
 
-    pdf.setFont('helvetica', 'normal')
+    pdf.setFont(pdfFontFamily, 'normal')
     pdf.setFontSize(9.5)
     setTextColorHex('555555')
     for (const line of (pdf.splitTextToSize(meta || ' ', maxWidth) as string[])) {
@@ -939,6 +1288,26 @@ const buildResumePdfBlobDocxStyle = (args: {
     }
 
     y += 6
+  }
+
+  // Key Achievements
+  const achievements = (draft.keyAchievements ?? []).map((s) => s.trim()).filter(Boolean)
+  if (achievements.length > 0) {
+    y = drawSectionHeading(SECTION_LABELS[language].achievements, y)
+    for (const a of achievements) {
+      y = drawBullet(a, y)
+    }
+    y = ensureSpace(y + 6, 12)
+  }
+
+  // Projects
+  const projects = (draft.projects ?? []).map((s) => s.trim()).filter(Boolean)
+  if (projects.length > 0) {
+    y = drawSectionHeading(SECTION_LABELS[language].projects, y)
+    for (const p of projects) {
+      y = drawBullet(p, y)
+    }
+    y = ensureSpace(y + 6, 12)
   }
 
   return pdf.output('blob')
@@ -1110,7 +1479,7 @@ const buildFileNames = (
   role?: string,
 ): SavedFiles => {
   const fullName = sanitizeFileName(buildCandidateFullName(profile), 'Candidate')
-  const title = sanitizeFileName(role ?? profile?.role_title ?? '', 'Role')
+  const title = sanitizeFileName(role ?? '', 'Role')
   const baseName = `${fullName} - ${title}`
   return {
     resume: `${baseName}.docx`,
@@ -1138,6 +1507,24 @@ export default function ResumeBuilder() {
     }
     return 'English'
   })
+  const [resumeStyle, setResumeStyle] = useState<ResumeStyle>(() => {
+    try {
+      const saved = localStorage.getItem('resume_generator_style')
+      if (
+        saved === 'Classic' ||
+        saved === 'Modern' ||
+        saved === 'Minimal' ||
+        saved === 'Executive' ||
+        saved === 'Creative' ||
+        saved === 'TrueCircle'
+      ) {
+        return saved
+      }
+    } catch {
+      // ignore
+    }
+    return 'Classic'
+  })
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [isSaved, setIsSaved] = useState(false)
@@ -1154,6 +1541,14 @@ export default function ResumeBuilder() {
       // ignore
     }
   }, [resumeLanguage])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('resume_generator_style', resumeStyle)
+    } catch {
+      // ignore
+    }
+  }, [resumeStyle])
 
   // (ATS Print-to-PDF export removed; reverted to previous behavior.)
 
@@ -1419,6 +1814,7 @@ export default function ResumeBuilder() {
       workHistory: draft.workHistory.map((item) => ({
         id: item.id,
         company: item.company,
+        // Keep the original stored title for reference only; resume output titles come from resumeTitle.
         title: item.title,
         start: item.start,
         end: item.end,
@@ -1442,7 +1838,7 @@ export default function ResumeBuilder() {
             {
               role: 'system',
               content:
-                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, claimedSkillsByCategory, suggestedSkillsByCategory, claimedSkills, workHistory (array of { id, bullets }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkills, workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
             },
             {
               role: 'user',
@@ -1453,6 +1849,29 @@ export default function ResumeBuilder() {
 INSTRUCTIONS:
 0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
    - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
+0.1 Target role focus (role-agnostic): The resume must read like a "${jobTitle}" resume first.
+   - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
+   - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${jobTitle}" and are supported by the payload + job description.
+   - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
+   - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
+0.2 Experience titles (required):
+   - For EVERY workHistory entry, generate a "resumeTitle" that is tailored to the target job role/JD.
+   - Do NOT reuse the original stored company-history title verbatim unless it already matches the target role; prefer role-aligned mapping (e.g., "Software Engineer" -> "Backend Engineer" for a backend JD).
+   - Keep resumeTitle truthful (do not inflate seniority); but word it to align with the target role.
+0.3 Completeness (required):
+   - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
+   - Every returned workHistory entry MUST include a non-empty resumeTitle string.
+0.4 Key Achievements + Projects (required):
+   - keyAchievements MUST be a non-empty array with 4–6 items.
+   - projects MUST be an array with EXACTLY 3 items.
+   - Each project must be extremely relevant to the job description.
+   - Each project item must be ONE sentence and must include ALL of:
+     a) a real user story (explicitly name the user persona and goal),
+     b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
+     c) the outcome/impact (include metrics if available; otherwise use "(est.)" for estimates).
+   - Each item must be action/outcome oriented and aligned to the target role/JD.
+   - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
 1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
 2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
 3. Do not summarize or paraphrase the job description before processing.
@@ -1477,12 +1896,12 @@ INSTRUCTIONS:
 19. The summary must reference relevant scale, performance, architecture, and business impact using keywords from the job description.
 20. The summary must not include company names or personal pronouns.
 21. Use past tense for previous roles and present tense only for the current role.
-22. Each role must contain 5-7 bullets.
+22. Each role must contain 5-7 bullets and should include at least 2 real metrics results.
 23. Each bullet must be one sentence only. No paragraphs.
 24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
-25. Only 2-3 bullets per role may include measurable impact (percentage improvements, scale, performance, cost, or time saved).
-27. The Skills section must be grouped into categories that match the job description's technology domains. Only include skills that are relevant to the job or present in the original resume.
-28. Each skills category should include at least 3 skills.
+25. The bullets should be outcome-driven and should include real metrics results as much as possible.
+27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
+28. Include 12–20 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
 29. All job-description technologies must appear in both Skills and Experience sections.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
@@ -1492,7 +1911,7 @@ Additional rules (apply exactly):
 
 - Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
 
-- Required top-level keys: summary (string), targetTitle (string), claimedSkillsByCategory (object), suggestedSkillsByCategory (object), claimedSkills (array), workHistory (array of { id, bullets: string[] }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
+- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkills (string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
 - Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
 
@@ -1502,12 +1921,12 @@ Additional rules (apply exactly):
   - Bullets must be action-oriented, concrete, mention technologies when relevant, and align with the provided job description (payload.notes).
   - Follow the structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
   - Do NOT include company names or date ranges inside bullets.
-  - Only 2-3 bullets per role may include explicit measurable impact.
+  - Prefer measurable outcomes in MOST bullets, but never fabricate numbers; use placeholders when necessary and record them in 'notes'.
   - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
 
 - Skills:
+  - Output claimedSkills as a flat array of strings (no categories).
   - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
-  - suggestedSkillsByCategory may list reasonable, plausible extensions (0–8 items) but clearly avoid repeating claimed skills.
   - All job-description technologies (P1/P2) must appear in both Skills and Experience sections.
 
 - Honesty & scope:
@@ -1540,56 +1959,187 @@ If you understand, return the single JSON object now.`,
         .trim()
       const parsed = JSON.parse(sanitizedContent)
 
-      // helper to build display lines from categorized objects
-      // merges claimed and suggested categories into lines like:
-      // Category: claimed1, claimed2; suggested: suggested1, suggested2
-      const buildDisplayLinesFromCategories = (
-        claimed: Record<string, string[]> = {},
-        suggested: Record<string, string[]> = {},
-      ) =>
-        Object.keys({ ...claimed, ...suggested })
-          .filter((k) => ((claimed[k] ?? []).length > 0) || ((suggested[k] ?? []).length > 0))
-          .map((k) => {
-            const claimedItems = (claimed[k] ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
-            const suggestedItems = (suggested[k] ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
-            // merge claimed and suggested items, claimed first, deduplicated preserving order
-            const seen = new Set<string>()
-            const merged: string[] = []
-            for (const it of [...claimedItems, ...suggestedItems]) {
-              const key = it.toLowerCase()
-              if (!seen.has(key)) {
-                seen.add(key)
-                merged.push(it)
-              }
-            }
-            return `${k}: ${merged.join(', ')}`
-          })
+      const sanitizeModelText = (s: unknown) =>
+        (s ?? '')
+          .toString()
+          .replace(/`+/g, '')
+          .replace(/^\s+|\s+$/g, '')
+          .replace(/\s+/g, ' ')
+
+      const parseModelJson = (raw: unknown) => {
+        const content = (raw ?? '').toString()
+        const cleaned = content
+          .replace(/^```json\s*/i, '')
+          .replace(/^```\s*/i, '')
+          .replace(/```\s*$/i, '')
+          .trim()
+        return JSON.parse(cleaned)
+      }
+
+      const ensureResumeTitles = async (draftParsed: any) => {
+        const requestedIds = payload.workHistory.map((w) => w.id)
+        const entries = Array.isArray(draftParsed?.workHistory) ? draftParsed.workHistory : []
+        const byId = new Map<string, any>()
+        for (const entry of entries) {
+          if (entry && typeof entry.id === 'string') byId.set(entry.id, entry)
+        }
+        const missingIds = requestedIds.filter((id) => {
+          const rt = byId.get(id)?.resumeTitle
+          return typeof rt !== 'string' || !rt.trim()
+        })
+
+        if (missingIds.length === 0) return draftParsed
+
+        // Ask the model for only the missing resume titles (no bullets).
+        const repairPayload = {
+          targetJobTitle: jobTitle,
+          targetTitle: draftParsed?.targetTitle ?? '',
+          jobDescription: notes,
+          workHistory: payload.workHistory.map((w) => ({
+            id: w.id,
+            originalTitle: w.title,
+            company: w.company,
+            start: w.start,
+            end: w.end,
+            location: w.location,
+          })),
+          missingIds,
+        }
+
+        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            messages: [
+              {
+                role: 'system',
+                content:
+                  'Output ONLY valid JSON (no markdown). Return: { workHistory: [{ id, resumeTitle }] } and nothing else.',
+              },
+              {
+                role: 'user',
+                content: `Generate role-aligned resumeTitle values for the missing workHistory ids. Titles must be tailored to the target job role, truthful, and not inflated in seniority. Do not invent new companies or change ids. Return one entry per missing id.\n\nPayload:\n${JSON.stringify(
+                  repairPayload,
+                )}`,
+              },
+            ],
+          }),
+        })
+
+        const repairData = await repairResponse.json().catch(() => null)
+        if (!repairResponse.ok) {
+          return draftParsed
+        }
+
+        const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+        const repairParsed = parseModelJson(repairContent)
+        const repairs = Array.isArray(repairParsed?.workHistory) ? repairParsed.workHistory : []
+        for (const r of repairs) {
+          if (!r || typeof r.id !== 'string') continue
+          if (!missingIds.includes(r.id)) continue
+          const rt = sanitizeModelText(r.resumeTitle)
+          if (!rt.trim()) continue
+          const existing = byId.get(r.id) ?? { id: r.id }
+          byId.set(r.id, { ...existing, resumeTitle: rt })
+        }
+
+        // Ensure the array has every id exactly once.
+        draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(draftParsed?.targetTitle ?? jobTitle) })
+        return draftParsed
+      }
+
+      const ensureProjectsAndAchievements = async (draftParsed: any) => {
+        const existingAchievements = Array.isArray(draftParsed?.keyAchievements)
+          ? draftParsed.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+        const existingProjects = Array.isArray(draftParsed?.projects)
+          ? draftParsed.projects.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+
+        const needsAchievements = existingAchievements.length === 0
+        const needsProjects = existingProjects.length === 0
+        if (!needsAchievements && !needsProjects) return draftParsed
+
+        const repairPayload = {
+          resumeLanguage,
+          targetJobTitle: jobTitle,
+          targetTitle: draftParsed?.targetTitle ?? '',
+          jobDescription: notes,
+          summary: draftParsed?.summary ?? payload.summary,
+          skills: draftParsed?.claimedSkills ?? payload.skills,
+          workHistory: (draftParsed?.workHistory ?? payload.workHistory).map((w: any) => ({
+            id: w.id,
+            resumeTitle: w.resumeTitle ?? w.title ?? '',
+            company: w.company ?? '',
+            bullets: w.bullets ?? [],
+          })),
+        }
+
+        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.3,
+            messages: [
+              {
+                role: 'system',
+                content:
+                  'Output ONLY valid JSON (no markdown). Return: { keyAchievements: string[], projects: string[] } and nothing else.',
+              },
+              {
+                role: 'user',
+                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; otherwise use \"(est.)\" for estimates).\n- Use measurable outcomes when reasonable; if you must estimate, mark as \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                  repairPayload,
+                )}`,
+              },
+            ],
+          }),
+        })
+
+        const repairData = await repairResponse.json().catch(() => null)
+        if (!repairResponse.ok) return draftParsed
+
+        const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+        const repaired = parseModelJson(repairContent)
+
+        const nextAchievements = Array.isArray(repaired?.keyAchievements)
+          ? repaired.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+        const nextProjects = Array.isArray(repaired?.projects)
+          ? repaired.projects.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+
+        if (needsAchievements && nextAchievements.length > 0) draftParsed.keyAchievements = nextAchievements
+        if (needsProjects && nextProjects.length > 0) draftParsed.projects = nextProjects
+        return draftParsed
+      }
+
+      const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(parsed))
 
       updateDraft((prev) => {
         // determine flattened claimed skills and optional display lines
         let flatSkills: string[] | undefined = undefined
-        let skillDisplayLines: string[] | undefined = undefined
+        const skillDisplayLines: string[] | undefined = undefined
 
-        if (parsed.claimedSkillsByCategory && typeof parsed.claimedSkillsByCategory === 'object') {
+        if (parsedWithTitles.claimedSkillsByCategory && typeof parsedWithTitles.claimedSkillsByCategory === 'object') {
           // prefer categorized response
-          const cat = parsed.claimedSkillsByCategory as Record<string, string[]>
-          const suggestedCat = parsed.suggestedSkillsByCategory && typeof parsed.suggestedSkillsByCategory === 'object'
-            ? (parsed.suggestedSkillsByCategory as Record<string, string[]>)
-            : {}
+          const cat = parsedWithTitles.claimedSkillsByCategory as Record<string, string[]>
           flatSkills = Array.from(new Set((Object.values(cat) ?? []).flat().map((s) => (s ?? '').trim()).filter(Boolean)))
-          skillDisplayLines = buildDisplayLinesFromCategories(cat, suggestedCat)
-        } else if (Array.isArray(parsed.claimedSkills)) {
+        } else if (Array.isArray(parsedWithTitles.claimedSkills)) {
           // fallback: model returned flat claimedSkills
-          flatSkills = parsed.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
-        } else if (Array.isArray(parsed.skills)) {
+          flatSkills = parsedWithTitles.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+        } else if (Array.isArray(parsedWithTitles.skills)) {
           // legacy fallback
-          flatSkills = parsed.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
-        }
-
-        // if we didn't get categorized claimed skills but have suggested categories, show them
-        if (!skillDisplayLines && parsed.suggestedSkillsByCategory && typeof parsed.suggestedSkillsByCategory === 'object') {
-          const suggestedOnly = parsed.suggestedSkillsByCategory as Record<string, string[]>
-          skillDisplayLines = buildDisplayLinesFromCategories({}, suggestedOnly)
+          flatSkills = parsedWithTitles.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
         }
 
         // helper to sanitize text returned from the model
@@ -1688,8 +2238,12 @@ If you understand, return the single JSON object now.`,
         const globalSeen = new Set<string>()
 
         const workHistory = prev.workHistory.map((item) => {
-          const next = parsed.workHistory?.find((entry: { id: string }) => entry.id === item.id)
+          const next = parsedWithTitles.workHistory?.find((entry: { id: string }) => entry.id === item.id)
           const incoming = Array.isArray(next?.bullets) && next.bullets.length > 0 ? next.bullets : item.bullets
+          const nextResumeTitle =
+            typeof next?.resumeTitle === 'string' && next.resumeTitle.trim()
+              ? sanitizeText(next.resumeTitle)
+              : undefined
           const localSeen = new Set<string>()
           const deduped: string[] = []
 
@@ -1699,10 +2253,11 @@ If you understand, return the single JSON object now.`,
 
             if (localSeen.has(key) || globalSeen.has(key)) {
               // attempt a light role-based variation if possible (do not invent companies)
-              if (item.title) {
+              const roleForPrefix = item.resume_title
+              if (roleForPrefix) {
                 // only add role prefix if the bullet doesn't already appear role-prefixed
                 if (!/^as a\s+/i.test(b)) {
-                  const rolePrefix = `As a ${item.title}, `
+                  const rolePrefix = `As a ${roleForPrefix}, `
                   const modified = rolePrefix + b.charAt(0).toLowerCase() + b.slice(1)
                   const modKey = normalize(modified)
                   if (!localSeen.has(modKey) && !globalSeen.has(modKey)) {
@@ -1722,19 +2277,33 @@ If you understand, return the single JSON object now.`,
             deduped.push(b)
           }
 
-          const finalBullets = normalizeCount(deduped.length > 0 ? deduped : item.bullets, item.title)
+          const finalBullets = normalizeCount(deduped.length > 0 ? deduped : item.bullets, item.resume_title)
           return {
             ...item,
+            // Never fall back to saved company-history titles in the generated resume output.
+            // If the model didn't provide a resumeTitle for this entry, use the generated targetTitle/jobTitle.
+            resume_title:
+              nextResumeTitle ??
+              item.resume_title ??
+              sanitizeText(parsed.targetTitle || '') ??
+              '',
             bullets: finalBullets,
           }
         })
 
         return {
           ...prev,
-          summary: parsed.summary ? sanitizeText(parsed.summary) : prev.summary,
+          targetTitle: parsedWithTitles.targetTitle ? sanitizeText(parsedWithTitles.targetTitle) : prev.targetTitle,
+          summary: parsedWithTitles.summary ? sanitizeText(parsedWithTitles.summary) : prev.summary,
             skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
             skillDisplayLines,
-            coverLetter: parsed.coverLetter ? sanitizeText(parsed.coverLetter) : prev.coverLetter,
+            coverLetter: parsedWithTitles.coverLetter ? sanitizeText(parsedWithTitles.coverLetter) : prev.coverLetter,
+          keyAchievements: Array.isArray(parsedWithTitles.keyAchievements)
+            ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
+            : prev.keyAchievements,
+          projects: Array.isArray(parsedWithTitles.projects)
+            ? parsedWithTitles.projects.map((s: string) => sanitizeText(s)).filter(Boolean)
+            : prev.projects,
           workHistory,
         }
       })
@@ -1743,7 +2312,7 @@ If you understand, return the single JSON object now.`,
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
-      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage))
+      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, jobTitle))
       setHasGenerated(true)
     } finally {
       setIsGenerating(false)
@@ -1832,47 +2401,14 @@ If you understand, return the single JSON object now.`,
     }
 
     const fullName = buildCandidateFullName(profile)
-    const titleLine = profile?.role_title ?? ''
+    const titleLine = (draft.targetTitle || jobTitle || '').trim()
     const locationLine = profile?.location ?? ''
     const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
-    // Prepare skills for display in DOCX.
-    // If skills are provided in "Category: item" form, group them by category
-    // and render as "Category: item1, item2". Keep uncategorized skills as-is.
-    let displaySkills: string[]
-    let flatKeywords: string[]
-    if (Array.isArray(draft.skillDisplayLines) && draft.skillDisplayLines.length > 0) {
-      // model returned categorized display lines
-      displaySkills = draft.skillDisplayLines
-      // build flat keywords from those lines (category: item1, item2 -> items)
-      flatKeywords = draft.skillDisplayLines
-        .map((line) => line.split(':').slice(1).join(':'))
-        .map((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
-        .flat()
-    } else {
-      const rawSkills = draft.skills.map((s) => s.trim()).filter(Boolean)
-      const categoryMap: Record<string, string[]> = {}
-      const uncategorized: string[] = []
-      for (const s of rawSkills) {
-        const parts = s.split(':').map((p) => p.trim()).filter(Boolean)
-        if (parts.length >= 2) {
-          const category = parts[0]
-          const item = parts.slice(1).join(':')
-          categoryMap[category] = categoryMap[category] ?? []
-          if (!categoryMap[category].includes(item)) categoryMap[category].push(item)
-        } else {
-          if (!uncategorized.includes(s)) uncategorized.push(s)
-        }
-      }
-      displaySkills = [
-        ...Object.keys(categoryMap).map((cat) => `${cat}: ${categoryMap[cat].join(', ')}`),
-        ...uncategorized,
-      ]
-
-      // Keywords used for highlighting should include both raw skills and grouped items
-      flatKeywords = Array.from(new Set(rawSkills.concat(...Object.values(categoryMap))))
-    }
+    // Skills are a flat list (no categories).
+    const displaySkills = normalizeSkillsForDisplay(draft.skills)
+    const flatKeywords = Array.from(new Set(displaySkills))
 
     // Expand keyword list to maximize highlighting in bullets:
     // - include flatKeywords (from skills and grouped items)
@@ -1885,7 +2421,12 @@ If you understand, return the single JSON object now.`,
     const keywordList = Array.from(keywordSet).filter(Boolean).sort((a, b) => b.length - a.length)
     const experienceRightIndent = 360
     const rightTabStop = 10080 - experienceRightIndent
-    const fontFamily = 'Arial'
+    const preset = getResumeStylePreset(resumeStyle)
+    const fontFamily = preset.fontFamily
+    const headingText = (value: string) => (preset.headingUppercase ? value.toUpperCase() : value)
+    const headerAlignment = preset.headerAlign === 'center' ? AlignmentType.CENTER : AlignmentType.LEFT
+    const headerNameColor = resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
+    const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
     const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       const buildHighlightedRuns = (text: string, size = 21) => {
       if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
@@ -1903,23 +2444,6 @@ If you understand, return the single JSON object now.`,
           )
           return new TextRun({ text: chunk, bold: isMatch, size, color: '111111', font: fontFamily })
         })
-    }
-    // Build runs for a skill line of the form "Category: item1, item2"
-    // Highlight (bold) the category label only; leave the items unhighlighted/plain.
-    const buildHighlightedSkillRuns = (text: string, size = 21) => {
-      if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
-      const idx = text.indexOf(':')
-      if (idx === -1) {
-        // no category separator — render as plain highlighted runs (keywords elsewhere still bold)
-        return buildHighlightedRuns(text, size)
-      }
-      const prefix = text.slice(0, idx + 1) + ' '
-      const rest = text.slice(idx + 1).trim()
-      // category label should be bold
-      const prefixRun = new TextRun({ text: prefix, bold: true, size, color: '111111', font: fontFamily })
-      // items should be plain (no keyword highlighting here)
-      const restRun = new TextRun({ text: rest, size, color: '111111', font: fontFamily })
-      return [prefixRun, restRun]
     }
     const experienceLine = (
       left: string,
@@ -1954,52 +2478,138 @@ If you understand, return the single JSON object now.`,
         alignment: AlignmentType.JUSTIFIED,
         spacing: { after: 30 },
       })
-    const sectionHeading = (text: string) =>
-      new Paragraph({
+    const sectionHeading = (text: string) => {
+      const label = headingText(text)
+      const baseSpacing = { before: 200, after: 80 }
+
+      if (preset.headingStyle === 'shaded') {
+        return new Paragraph({
+          children: [
+            new TextRun({
+              text: label,
+              bold: true,
+              color: '111111',
+              size: 21,
+              font: fontFamily,
+            }),
+          ],
+          spacing: baseSpacing,
+          shading: { type: ShadingType.CLEAR, fill: 'EEEEEE', color: 'auto' },
+        })
+      }
+
+      if (preset.headingStyle === 'boxed') {
+        return new Paragraph({
+          children: [
+            new TextRun({
+              text: label,
+              bold: true,
+              color: 'FFFFFF',
+              size: 21,
+              font: fontFamily,
+            }),
+          ],
+          spacing: baseSpacing,
+          shading: { type: ShadingType.CLEAR, fill: preset.accentHex.toUpperCase(), color: 'auto' },
+          border: {
+            top: { color: preset.accentHex, space: 1, value: BorderStyle.SINGLE, size: 10 },
+            bottom: { color: preset.accentHex, space: 1, value: BorderStyle.SINGLE, size: 10 },
+            left: { color: preset.accentHex, space: 1, value: BorderStyle.SINGLE, size: 10 },
+            right: { color: preset.accentHex, space: 1, value: BorderStyle.SINGLE, size: 10 },
+          },
+        })
+      }
+
+      if (preset.headingStyle === 'bar') {
+        return new Paragraph({
+          children: [
+            new TextRun({
+              text: label,
+              bold: true,
+              color: '111111',
+              size: 21,
+              font: fontFamily,
+            }),
+          ],
+          spacing: baseSpacing,
+          border: {
+            left: { color: preset.accentHex, space: 1, value: BorderStyle.SINGLE, size: 18 },
+          },
+          indent: { left: 180 },
+        })
+      }
+
+      if (preset.headingStyle === 'none') {
+        return new Paragraph({
+          children: [
+            new TextRun({
+              text: label,
+              bold: true,
+              color: '555555',
+              size: 19,
+              font: fontFamily,
+            }),
+          ],
+          spacing: { before: 160, after: 60 },
+        })
+      }
+
+      // underline (default)
+      return new Paragraph({
         children: [
           new TextRun({
-            text,
+            text: label,
             bold: true,
             color: '111111',
             size: 21,
             font: fontFamily,
           }),
         ],
-        spacing: { before: 200, after: 80 },
+        spacing: baseSpacing,
         border: {
           bottom: {
-            color: '333333',
+            color: preset.accentHex.toUpperCase(),
             space: 1,
             value: BorderStyle.SINGLE,
             size: 12,
           },
         },
       })
+    }
     const educationMeta = (text: string) =>
       new Paragraph({
         children: [new TextRun({ text, size: 19, color: '555555', font: fontFamily })],
         spacing: { after: 60 },
       })
     
-    const docxSectionLabels: Record<ResumeLanguage, { summary: string; skills: string; experience: string; education: string }> =
+    const docxSectionLabels: Record<
+      ResumeLanguage,
+      { summary: string; skills: string; experience: string; education: string; achievements: string; projects: string }
+    > =
       {
         English: {
           summary: 'SUMMARY',
           skills: 'TECHNICAL SKILLS',
           experience: 'EXPERIENCE',
           education: 'EDUCATION',
+          achievements: 'KEY ACHIEVEMENTS',
+          projects: 'PROJECTS',
         },
         Japanese: {
           summary: '概要',
           skills: '技術スキル',
           experience: '職務経歴',
           education: '学歴',
+          achievements: '主な実績',
+          projects: 'プロジェクト',
         },
         Chinese: {
           summary: '概要',
           skills: '技术技能',
           experience: '工作经历',
           education: '教育背景',
+          achievements: '关键成果',
+          projects: '项目',
         },
       }
 
@@ -2032,11 +2642,11 @@ If you understand, return the single JSON object now.`,
                   text: fullName,
                   bold: true,
                   size: 38,
-                  color: '111111',
+                  color: headerNameColor,
                   font: fontFamily,
                 }),
               ],
-              alignment: AlignmentType.CENTER,
+              alignment: headerAlignment,
               spacing: { after: 40 },
             }),
             ...(titleLine
@@ -2047,11 +2657,11 @@ If you understand, return the single JSON object now.`,
                         text: titleLine,
                         bold: true,
                         size: 23,
-                        color: '333333',
+                        color: headerTitleColor,
                         font: fontFamily,
                       }),
                     ],
-                    alignment: AlignmentType.CENTER,
+                    alignment: headerAlignment,
                     spacing: { after: locationLine ? 20 : 40 },
                   }),
                 ]
@@ -2060,7 +2670,7 @@ If you understand, return the single JSON object now.`,
               ? [
                   new Paragraph({
                     children: [new TextRun({ text: locationLine, size: 20, color: '555555', font: fontFamily })],
-                    alignment: AlignmentType.CENTER,
+                    alignment: headerAlignment,
                     spacing: { after: contactLine ? 10 : 50 },
                   }),
                 ]
@@ -2069,40 +2679,29 @@ If you understand, return the single JSON object now.`,
               ? [
                   new Paragraph({
                     children: [new TextRun({ text: contactLine, size: 20, color: '555555', font: fontFamily })],
-                    alignment: AlignmentType.CENTER,
+                    alignment: headerAlignment,
                     spacing: { after: 60 },
                   }),
                 ]
               : []),
-            new Table({
-              width: { size: 100, type: WidthType.PERCENTAGE },
-              layout: TableLayoutType.FIXED,
-              borders: {
-                top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                insideVertical: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-              },
-              rows: [
-                new TableRow({
-                  children: [
-                    new TableCell({
-                      width: { size: 100, type: WidthType.PERCENTAGE },
-                      borders: {
-                        top: { style: BorderStyle.SINGLE, size: 18, color: '000000' },
-                        bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                        left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                        right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            ...(preset.dividerStyle === 'none'
+              ? []
+              : [
+                  new Paragraph({
+                      // Word may skip rendering borders on an empty paragraph.
+                      // Keep a single whitespace run so the separator line always appears.
+                      children: [new TextRun({ text: ' ', font: fontFamily, size: 2, color: 'FFFFFF' })],
+                    border: {
+                      bottom: {
+                        color: preset.accentHex.toUpperCase(),
+                        space: 1,
+                        value: BorderStyle.SINGLE,
+                        size: preset.dividerStyle === 'thick' ? 18 : 10,
                       },
-                      margins: { top: 0, bottom: 0, left: 0, right: 0 },
-                      children: [new Paragraph({ text: '' })],
-                    }),
-                  ],
-                }),
-              ],
-            }),
+                    },
+                    spacing: { after: 60 },
+                  }),
+                ]),
             new Paragraph({ text: '', spacing: { before: 16, after: 40 } }),
             sectionHeading(docxSectionLabels[resumeLanguage].summary),
             new Paragraph({
@@ -2111,21 +2710,17 @@ If you understand, return the single JSON object now.`,
               spacing: { after: 140 },
             }),
             sectionHeading(docxSectionLabels[resumeLanguage].skills),
-              // Render each skill display line as a full-width bullet (not a multi-column grid)
-              // displaySkills contains lines like "Frontend: React, TypeScript" or uncategorized skills
-              ...displaySkills.map((line) =>
-                new Paragraph({
-                  children: buildHighlightedSkillRuns(line, 20),
-                  bullet: { level: 0 },
-                  alignment: AlignmentType.LEFT,
-                  spacing: { after: 60 },
-                }),
-              ),
+            new Paragraph({
+              // Skills should be plain (no keyword bolding).
+              children: [new TextRun({ text: displaySkills.join(' • '), size: 20, color: '111111', font: fontFamily })],
+              alignment: AlignmentType.LEFT,
+              spacing: { after: 140 },
+            }),
             new Paragraph({ text: '', spacing: { after: 80 } }),
             sectionHeading(docxSectionLabels[resumeLanguage].experience),
             ...draft.workHistory.flatMap((item) => [
               experienceLine(
-                item.title || 'Role',
+                item.resume_title || 'Role',
                 `${monthToLabel(item.start)} - ${
                   item.end === 'Present' ? 'Present' : monthToLabel(item.end)
                 }`,
@@ -2167,6 +2762,40 @@ If you understand, return the single JSON object now.`,
                   .join(' | '),
               ),
             ),
+            ...(draft.keyAchievements ?? []).map((value) => value.trim()).filter(Boolean).length > 0
+              ? [
+                  new Paragraph({ text: '', spacing: { after: 80 } }),
+                  sectionHeading(docxSectionLabels[resumeLanguage].achievements),
+                  ...(draft.keyAchievements ?? [])
+                    .map((value) => value.trim())
+                    .filter(Boolean)
+                    .map((bullet) =>
+                      new Paragraph({
+                        children: buildHighlightedRuns(bullet, 20),
+                        bullet: { level: 0 },
+                        alignment: AlignmentType.JUSTIFIED,
+                        spacing: { after: 30 },
+                      }),
+                    ),
+                ]
+              : [],
+            ...(draft.projects ?? []).map((value) => value.trim()).filter(Boolean).length > 0
+              ? [
+                  new Paragraph({ text: '', spacing: { after: 80 } }),
+                  sectionHeading(docxSectionLabels[resumeLanguage].projects),
+                  ...(draft.projects ?? [])
+                    .map((value) => value.trim())
+                    .filter(Boolean)
+                    .map((bullet) =>
+                      new Paragraph({
+                        children: buildHighlightedRuns(bullet, 20),
+                        bullet: { level: 0 },
+                        alignment: AlignmentType.JUSTIFIED,
+                        spacing: { after: 30 },
+                      }),
+                    ),
+                ]
+              : [],
           ],
         },
       ],
@@ -2177,18 +2806,19 @@ If you understand, return the single JSON object now.`,
       profile,
       draft,
       companyName: companyName || '',
-      jobTitle: jobTitle || '',
+      jobTitle: (draft.targetTitle || jobTitle || '').trim(),
       language: resumeLanguage,
+      style: resumeStyle,
     })
     const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
-    const roleSlug = sanitizeFilePart(jobTitle || profile?.role_title || '', 'role')
+    const roleSlug = sanitizeFilePart((draft.targetTitle || jobTitle || '').trim(), 'role')
     const companySlug = sanitizeFilePart(companyName || '', 'company')
     const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
     const coverText = draft.coverLetter || ''
     const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft, language: resumeLanguage })
 
     const resumeBaseName = sanitizeFileName(
-      `${buildCandidateFullName(profile) || 'Candidate'} - ${jobTitle || profile?.role_title || 'Role'}`,
+      `${buildCandidateFullName(profile) || 'Candidate'} - ${(draft.targetTitle || jobTitle || 'Role').trim()}`,
       'Resume',
     )
     const resumeDocxName = `${resumeBaseName}.docx`
@@ -2302,6 +2932,27 @@ If you understand, return the single JSON object now.`,
                   <option value="English">English</option>
                   <option value="Japanese">Japanese</option>
                   <option value="Chinese">Chinese</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/40 px-3 py-2 text-xs font-semibold text-slate-200">
+                <span className="text-slate-300">Style</span>
+                <select
+                  value={resumeStyle}
+                  onChange={(event) => {
+                    const next = event.target.value as ResumeStyle
+                    setResumeStyle(next)
+                    markUnsaved()
+                    setHasGenerated(false)
+                  }}
+                  className="rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-xs text-slate-100 focus:border-indigo-400 focus:outline-none"
+                >
+                  {(
+                    ['Classic', 'Modern', 'Minimal', 'Executive', 'Creative', 'TrueCircle'] as ResumeStyle[]
+                  ).map((style) => (
+                    <option key={style} value={style}>
+                      {getResumeStylePreset(style).label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <button
@@ -2483,7 +3134,7 @@ If you understand, return the single JSON object now.`,
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <p className="text-sm font-semibold text-white">
-                      {item.title || 'Role'} · {item.company || 'Company'}
+                      {item.resume_title || 'Role'} · {item.company || 'Company'}
                     </p>
                     <p className="text-xs text-slate-400">
                       {monthToLabel(item.start)} - {item.end === 'Present' ? 'Present' : monthToLabel(item.end)}
@@ -2603,6 +3254,46 @@ If you understand, return the single JSON object now.`,
               <p className="text-xs text-slate-400">No education entries yet.</p>
             )}
           </div>
+        </section>
+
+        <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
+          <h2 className="text-base font-semibold text-white">Key Achievements</h2>
+          <p className="mt-1 text-xs text-slate-400">One achievement per line.</p>
+          <textarea
+            value={(draft.keyAchievements ?? []).join('\n')}
+            onChange={(event) =>
+              updateDraft((prev) => ({
+                ...prev,
+                keyAchievements: event.target.value
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              }))
+            }
+            rows={5}
+            placeholder={"Examples:\n- Reduced p95 latency by 35% by optimizing caching and queries\n- Cut cloud spend by $8k/month via right-sizing and scheduling\n- Improved data quality with automated checks and alerts"}
+            className="mt-3 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
+          />
+        </section>
+
+        <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
+          <h2 className="text-base font-semibold text-white">Projects</h2>
+          <p className="mt-1 text-xs text-slate-400">One project bullet per line.</p>
+          <textarea
+            value={(draft.projects ?? []).join('\n')}
+            onChange={(event) =>
+              updateDraft((prev) => ({
+                ...prev,
+                projects: event.target.value
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              }))
+            }
+            rows={5}
+            placeholder={"Examples:\n- Built an end-to-end migration plan and executed a phased rollout with zero downtime\n- Implemented an internal tooling dashboard to reduce manual ops work\n- Created a reusable library to standardize validation and error handling"}
+            className="mt-3 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
+          />
         </section>
 
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
