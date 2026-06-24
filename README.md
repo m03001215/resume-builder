@@ -22,6 +22,20 @@ Modern React + Tailwind + TypeScript app for resume and cover letter generation 
 2. Copy `.env.example` to `.env.local` and add your Supabase project values.
 3. Ensure the Supabase database has the tables and fields described below.
 
+## Deploy to Vercel
+
+Vercel **does not** use your local `.env.local` file (and it should not be committed).
+
+Set these in **Vercel → Project Settings → Environment Variables**, then redeploy:
+
+- `VITE_SUPABASE_URL` (**required**)
+- `VITE_SUPABASE_ANON_KEY` (**required**)
+
+Optional (resume generation):
+
+- `VITE_OPENAI_API_KEY` (warning: Vite env vars are exposed in the browser)
+- `VITE_OPENAI_MODEL`
+
 ### Resume generation (optional)
 
 Set the following environment variables to enable OpenAI-powered content:

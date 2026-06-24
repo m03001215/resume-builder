@@ -28,7 +28,7 @@ import { supabase } from '../lib/supabaseClient'
 
 type ResumeLanguage = 'English' | 'Japanese' | 'Chinese'
 
-type ResumeStyle = 'Classic' | 'Modern' | 'Minimal' | 'Executive' | 'Creative' | 'TrueCircle'
+type ResumeStyle = 'Classic' | 'Modern' | 'Minimal' | 'Executive' | 'Creative' | 'TrueCircle' | 'Wide'
 
 type ResumeStylePreset = {
   label: string
@@ -36,6 +36,14 @@ type ResumeStylePreset = {
   headerAlign: 'center' | 'left'
   fontFamily: string
   pdfFontFamily: 'times' | 'helvetica' | 'courier'
+  pdfPageSizePt?: [number, number]
+  pdfMarginPt?: number
+  pdfMarginPtX?: number
+  pdfMarginPtY?: number
+  docxMarginTwips?: number
+  docxMarginTwipsX?: number
+  docxMarginTwipsY?: number
+  docxPageSizeTwips?: { width: number; height: number }
   accentHex: string // 6-char hex without '#'
   headingStyle: 'underline' | 'bar' | 'shaded' | 'boxed' | 'none'
   headingUppercase: boolean
@@ -124,6 +132,28 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
     fontFamily: 'Cambria',
     pdfFontFamily: 'times',
     accentHex: '2563eb',
+    headingStyle: 'underline',
+    headingUppercase: true,
+    dividerStyle: 'thin',
+    bulletChar: '•',
+    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+  },
+  Wide: {
+    label: 'Wide',
+    description: 'Extra-wide paper to reduce wrapping (ATS-friendly).',
+    headerAlign: 'left',
+    fontFamily: 'Verdana',
+    pdfFontFamily: 'helvetica',
+    // Tabloid paper (11x17) so lines fit without tiny margins.
+    pdfPageSizePt: [792, 1224],
+    docxPageSizeTwips: { width: 15840, height: 24480 },
+    // Comfortable margins (more space before name, larger left/right margins).
+    // Smaller left/right, more top/bottom padding.
+    pdfMarginPtX: 36,
+    pdfMarginPtY: 72,
+    docxMarginTwipsX: 720,
+    docxMarginTwipsY: 1440,
+    accentHex: '0ea5e9',
     headingStyle: 'underline',
     headingUppercase: true,
     dividerStyle: 'thin',
@@ -452,6 +482,9 @@ const sanitizeFileName = (value: string, fallback: string) => {
   return truncated || fallback
 }
 
+const stripTrailingEstimateTag = (value: string) =>
+  (value ?? '').replace(/\s*\(est\.\)\s*$/i, '').trim()
+
 const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
   [profile?.first_name, profile?.middle_name, profile?.last_name]
     .filter((value): value is string => Boolean(value && value.trim()))
@@ -483,6 +516,160 @@ const normalizeSkillsForDisplay = (skills: string[]) => {
   return out
 }
 
+const buildImportantHighlightKeywords = (skills: string[]) => {
+  const stopwords = new Set<string>([
+    // articles / connectors
+    'a',
+    'an',
+    'the',
+    'and',
+    'or',
+    'to',
+    'of',
+    'in',
+    'on',
+    'for',
+    'with',
+    'as',
+    'at',
+    'by',
+    'from',
+    'into',
+    'via',
+    'within',
+    'across',
+    'over',
+    'under',
+    'per',
+    'vs',
+    // too-generic words that create noisy bolding
+    'data',
+    'time',
+  ])
+
+  const importantShort = new Set<string>([
+    'ai',
+    'ml',
+    'ui',
+    'ux',
+    'qa',
+    'ci',
+    'cd',
+    'aws',
+    'gcp',
+    'sql',
+    'etl',
+    'api',
+    'sdk',
+    'jwt',
+    'kpi',
+    'okr',
+    'git',
+  ])
+
+  const phrases = (skills ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
+  const out: string[] = []
+  const seen = new Set<string>()
+
+  const push = (value: string) => {
+    const v = value.trim()
+    if (!v) return
+    const key = v.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(v)
+  }
+
+  // Always include full phrases (e.g., "AWS Lambda", "Real-time streaming").
+  // Also include simple hyphen/space variants so "graph based" and "graph-based" both highlight as one.
+  for (const phrase of phrases) {
+    push(phrase)
+    const withAsciiHyphen = phrase.replace(/[–—]/g, '-')
+    const spaced = withAsciiHyphen.replace(/-/g, ' ').replace(/\s+/g, ' ').trim()
+    const hyphenated = withAsciiHyphen.replace(/\s+/g, '-').trim()
+    if (spaced && spaced !== phrase) push(spaced)
+    if (hyphenated && hyphenated !== phrase) push(hyphenated)
+  }
+
+  // Add selective tokens derived from phrases (avoid short/common words).
+  for (const phrase of phrases) {
+    const tokens = phrase.match(/[A-Za-z0-9]+/g) ?? []
+    for (const token of tokens) {
+      const lower = token.toLowerCase()
+      if (!lower || stopwords.has(lower)) continue
+
+      const isAcronym = token === token.toUpperCase() && /[A-Z]/.test(token) && token.length >= 2 && token.length <= 6
+      if (importantShort.has(lower) || isAcronym || token.length >= 4) {
+        push(token)
+      }
+    }
+  }
+
+  // Sort longest-first so phrases match before sub-tokens.
+  return out.sort((a, b) => b.length - a.length)
+}
+
+const normalizeHighlightKey = (value: string) =>
+  (value ?? '')
+    .toLowerCase()
+    .replace(/[–—]/g, '-')
+    .trim()
+
+const keywordToRegexPart = (keyword: string) => {
+  // Escape regex metacharacters, then allow any dash variant where '-' appears.
+  const escaped = (keyword ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return escaped.replace(/-/g, '[-–—]')
+}
+
+const mergeHyphenatedHighlights = <T extends { text: string; bold: boolean }>(tokens: T[]): T[] => {
+  const out: T[] = []
+  for (const token of tokens) {
+    const prev = out[out.length - 1]
+    if (!prev) {
+      out.push(token)
+      continue
+    }
+
+    // Case 1: "data-" (not bold) + "driven" (bold) -> "data-driven" (bold)
+    if (!prev.bold && token.bold && /[-–—]$/.test(prev.text) && /[A-Za-z0-9]$/.test(prev.text.slice(0, -1))) {
+      out[out.length - 1] = { ...(prev as any), text: prev.text + token.text, bold: true }
+      continue
+    }
+
+    // Case 2: "graph" (bold) + "-based" (not bold) -> "graph-based" (bold)
+    if (prev.bold && !token.bold && /^[-–—][A-Za-z0-9]/.test(token.text) && !/\s/.test(token.text)) {
+      out[out.length - 1] = { ...(prev as any), text: prev.text + token.text, bold: true }
+      continue
+    }
+
+    out.push(token)
+  }
+  return out
+}
+
+const limitRepeatedHighlights = <T extends { text: string; bold: boolean }>(tokens: T[]): T[] => {
+  // Reduce noisy repetitive bolding within the same paragraph.
+  const maxTotalBold = 14
+  const counts = new Map<string, number>()
+  let totalBold = 0
+
+  return tokens.map((token) => {
+    if (!token.bold) return token
+
+    const key = normalizeHighlightKey(token.text)
+    const maxPerKey = key.length <= 3 ? 1 : 2
+    const nextCount = (counts.get(key) ?? 0) + 1
+
+    if (totalBold >= maxTotalBold || nextCount > maxPerKey) {
+      return { ...(token as any), bold: false }
+    }
+
+    counts.set(key, nextCount)
+    totalBold += 1
+    return token
+  })
+}
+
 const SECTION_LABELS: Record<
   ResumeLanguage,
   {
@@ -497,7 +684,7 @@ const SECTION_LABELS: Record<
 > = {
   English: {
     summary: 'SUMMARY',
-    skills: 'TECHNICAL SKILLS',
+    skills: 'SKILLS',
     experience: 'EXPERIENCE',
     education: 'EDUCATION',
     achievements: 'KEY ACHIEVEMENTS',
@@ -601,15 +788,17 @@ const buildResumePdfBlobRasterized = (args: {
 
   // Render each PDF page as an image drawn on a canvas using system fonts (Unicode-safe),
   // then embed the image into a PDF.
-  const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+  const pdf = new jsPDF({ unit: 'pt', format: preset.pdfPageSizePt ?? 'letter' })
   const pageWidthPt = pdf.internal.pageSize.getWidth()
   const pageHeightPt = pdf.internal.pageSize.getHeight()
-  const marginPt = 54
+  const marginPtX = preset.pdfMarginPtX ?? preset.pdfMarginPt ?? 54
+  const marginPtY = preset.pdfMarginPtY ?? preset.pdfMarginPt ?? 54
 
   const scale = 2
   const pageWidthPx = Math.round(pageWidthPt * scale)
   const pageHeightPx = Math.round(pageHeightPt * scale)
-  const marginPx = Math.round(marginPt * scale)
+  const marginPxX = Math.round(marginPtX * scale)
+  const marginPxY = Math.round(marginPtY * scale)
 
   const fontFamily = getCanvasFontStack(language, preset.fontFamily)
 
@@ -656,9 +845,9 @@ const buildResumePdfBlobRasterized = (args: {
 
   let { canvas, ctx } = newPageCanvas()
   let isFirstPage = true
-  let y = marginPx
+  let y = marginPxY
 
-  const maxWidthPx = pageWidthPx - marginPx * 2
+  const maxWidthPx = pageWidthPx - marginPxX * 2
 
   const setFont = (sizePt: number, bold = false) => {
     const sizePx = Math.round(sizePt * scale)
@@ -666,11 +855,11 @@ const buildResumePdfBlobRasterized = (args: {
   }
 
   const ensureSpace = (neededPx: number) => {
-    if (y + neededPx <= pageHeightPx - marginPx) return
+    if (y + neededPx <= pageHeightPx - marginPxY) return
     embedCanvasPage(canvas, isFirstPage)
     isFirstPage = false
     ;({ canvas, ctx } = newPageCanvas())
-    y = marginPx
+    y = marginPxY
   }
 
   const drawHeader = (text: string, sizePt: number, bold: boolean, colorHex: string, afterPx: number) => {
@@ -689,7 +878,7 @@ const buildResumePdfBlobRasterized = (args: {
       const x =
         preset.headerAlign === 'center'
           ? Math.round((pageWidthPx - w) / 2)
-          : marginPx
+          : marginPxX
       ctx.fillText(line, x, y)
       y += lineHeight
     }
@@ -702,8 +891,8 @@ const buildResumePdfBlobRasterized = (args: {
     ctx.strokeStyle = rgbStr(preset.accentHex)
     ctx.lineWidth = Math.round((preset.dividerStyle === 'thick' ? 2.25 : 1.25) * scale)
     ctx.beginPath()
-    ctx.moveTo(marginPx, y)
-    ctx.lineTo(pageWidthPx - marginPx, y)
+    ctx.moveTo(marginPxX, y)
+    ctx.lineTo(pageWidthPx - marginPxX, y)
     ctx.stroke()
     y += Math.round(18 * scale)
   }
@@ -718,9 +907,9 @@ const buildResumePdfBlobRasterized = (args: {
       const h = Math.round(18 * scale)
       ensureSpace(h)
       ctx.fillStyle = 'rgb(238,238,238)'
-      ctx.fillRect(marginPx, y - Math.round(13 * scale), pageWidthPx - marginPx * 2, h)
+      ctx.fillRect(marginPxX, y - Math.round(13 * scale), pageWidthPx - marginPxX * 2, h)
       ctx.fillStyle = rgbStr('111111')
-      ctx.fillText(text, marginPx + Math.round(8 * scale), y)
+      ctx.fillText(text, marginPxX + Math.round(8 * scale), y)
       y += Math.round(16 * scale)
       return
     }
@@ -729,13 +918,13 @@ const buildResumePdfBlobRasterized = (args: {
       const paddingX = Math.round(8 * scale)
       const paddingY = Math.round(5 * scale)
       const w = ctx.measureText(text).width
-      const boxW = Math.min(pageWidthPx - marginPx * 2, w + paddingX * 2)
+      const boxW = Math.min(pageWidthPx - marginPxX * 2, w + paddingX * 2)
       const boxH = Math.round(18 * scale)
       ensureSpace(boxH)
       ctx.fillStyle = rgbStr(preset.accentHex)
-      ctx.fillRect(marginPx, y - Math.round(13 * scale) - paddingY, boxW, boxH + paddingY)
+      ctx.fillRect(marginPxX, y - Math.round(13 * scale) - paddingY, boxW, boxH + paddingY)
       ctx.fillStyle = '#ffffff'
-      ctx.fillText(text, marginPx + paddingX, y)
+      ctx.fillText(text, marginPxX + paddingX, y)
       y += Math.round(18 * scale)
       return
     }
@@ -744,23 +933,23 @@ const buildResumePdfBlobRasterized = (args: {
       const barW = Math.round(4 * scale)
       const barH = Math.round(16 * scale)
       ctx.fillStyle = rgbStr(preset.accentHex)
-      ctx.fillRect(marginPx, y - Math.round(12 * scale), barW, barH)
+      ctx.fillRect(marginPxX, y - Math.round(12 * scale), barW, barH)
       ctx.fillStyle = rgbStr('111111')
-      ctx.fillText(text, marginPx + Math.round(10 * scale), y)
+      ctx.fillText(text, marginPxX + Math.round(10 * scale), y)
       y += Math.round(18 * scale)
       return
     }
 
     // underline / none
     ctx.fillStyle = rgbStr('111111')
-    ctx.fillText(text, marginPx, y)
+    ctx.fillText(text, marginPxX, y)
     if (preset.headingStyle === 'underline') {
       y += Math.round(6 * scale)
       ctx.strokeStyle = rgbStr(preset.accentHex)
       ctx.lineWidth = Math.round(1.5 * scale)
       ctx.beginPath()
-      ctx.moveTo(marginPx, y)
-      ctx.lineTo(pageWidthPx - marginPx, y)
+      ctx.moveTo(marginPxX, y)
+      ctx.lineTo(pageWidthPx - marginPxX, y)
       ctx.stroke()
       y += Math.round(16 * scale)
     } else {
@@ -780,7 +969,7 @@ const buildResumePdfBlobRasterized = (args: {
     })
     for (const line of lines) {
       ensureSpace(lineHeightPx)
-      ctx.fillText(line, marginPx, y)
+      ctx.fillText(line, marginPxX, y)
       y += lineHeightPx
     }
     y += Math.round(afterPt * scale)
@@ -791,7 +980,7 @@ const buildResumePdfBlobRasterized = (args: {
     setFont(10, false)
     ctx.fillStyle = '#111111'
     ensureSpace(lineHeightPx)
-    ctx.fillText(preset.bulletChar, marginPx, y)
+    ctx.fillText(preset.bulletChar, marginPxX, y)
     const indentPx = Math.round(12 * scale)
     const bulletMaxWidthPx = maxWidthPx - indentPx
     const lines = wrapTextByMeasure({
@@ -803,7 +992,7 @@ const buildResumePdfBlobRasterized = (args: {
     let first = true
     for (const line of lines) {
       if (!first) ensureSpace(lineHeightPx)
-      ctx.fillText(line, marginPx + indentPx, y)
+      ctx.fillText(line, marginPxX + indentPx, y)
       y += lineHeightPx
       first = false
     }
@@ -814,7 +1003,7 @@ const buildResumePdfBlobRasterized = (args: {
     setFont(sizePt, false)
     ctx.fillStyle = rgbStr(colorHex)
     const w = ctx.measureText(text).width
-    const x = pageWidthPx - marginPx - w
+    const x = pageWidthPx - marginPxX - w
     ctx.fillText(text, x, y)
   }
 
@@ -847,12 +1036,12 @@ const buildResumePdfBlobRasterized = (args: {
       maxWidth: maxWidthPx * 0.62,
       language,
     })
-    ctx.fillText(leftLines[0] ?? '', marginPx, y)
+    ctx.fillText(leftLines[0] ?? '', marginPxX, y)
     drawRightAligned(dates, 9.5, '555555')
     y += Math.round(16 * scale)
     for (const extra of leftLines.slice(1)) {
       ensureSpace(Math.round(16 * scale))
-      ctx.fillText(extra, marginPx, y)
+      ctx.fillText(extra, marginPxX, y)
       y += Math.round(16 * scale)
     }
     y += Math.round(10 * scale)
@@ -867,12 +1056,12 @@ const buildResumePdfBlobRasterized = (args: {
       maxWidth: maxWidthPx * 0.62,
       language,
     })
-    ctx.fillText(companyLines[0] ?? '', marginPx, y)
+    ctx.fillText(companyLines[0] ?? '', marginPxX, y)
     drawRightAligned(locMode, 9.5, '555555')
     y += Math.round(16 * scale)
     for (const extra of companyLines.slice(1)) {
       ensureSpace(Math.round(16 * scale))
-      ctx.fillText(extra, marginPx, y)
+      ctx.fillText(extra, marginPxX, y)
       y += Math.round(16 * scale)
     }
     y += Math.round(12 * scale)
@@ -921,11 +1110,12 @@ const buildResumePdfBlobDocxStyle = (args: {
     .join(' | ')
 
   // Uses jsPDF built-in PDF fonts. We pick font per resume style.
-  const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
+  const pdf = new jsPDF({ unit: 'pt', format: preset.pdfPageSizePt ?? 'letter' })
   const pageWidth = pdf.internal.pageSize.getWidth()
   const pageHeight = pdf.internal.pageSize.getHeight()
-  const margin = 54 // 1080 twips = 0.75in
-  const maxWidth = pageWidth - margin * 2
+  const marginX = preset.pdfMarginPtX ?? preset.pdfMarginPt ?? 54
+  const marginY = preset.pdfMarginPtY ?? preset.pdfMarginPt ?? 54
+  const maxWidth = pageWidth - marginX * 2
 
   // PDF spacing controls (tune UX here).
   const PDF_SPACING = {
@@ -957,27 +1147,17 @@ const buildResumePdfBlobDocxStyle = (args: {
   }
 
   const ensureSpace = (y: number, needed: number) => {
-    if (y + needed <= pageHeight - margin) return y
+    if (y + needed <= pageHeight - marginY) return y
     pdf.addPage()
-    return margin
+    return marginY
   }
-
-  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
   // Keyword highlighting logic matches DOCX generator.
   // Skills are a flat list (no categories).
   const displaySkills = normalizeSkillsForDisplay(draft.skills)
-  const flatKeywords = Array.from(new Set(displaySkills))
-
-  const extraTokens = flatKeywords
-    .map((k) => k.split(/[\s,/\-()]+/).map((t) => t.trim()).filter(Boolean))
-    .flat()
-  const keywordSet = new Set<string>([
-    ...flatKeywords.map((k) => k.trim()).filter(Boolean),
-    ...extraTokens.map((k) => k.trim()).filter(Boolean),
-  ])
-  const keywordList = Array.from(keywordSet).filter(Boolean).sort((a, b) => b.length - a.length)
-  const keywordLower = new Set(keywordList.map((k) => k.toLowerCase()))
+  // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
+  const keywordList = buildImportantHighlightKeywords(displaySkills)
+  const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
 
   type Token = { text: string; bold: boolean }
 
@@ -986,11 +1166,15 @@ const buildResumePdfBlobDocxStyle = (args: {
   const buildHighlightedTokens = (text: string): Token[] => {
     if (!text) return [{ text, bold: false }]
     if (keywordList.length === 0) return [{ text, bold: false }]
-    const pattern = new RegExp(`\\b(${keywordList.map(escapeRegExp).join('|')})\\b`, 'gi')
-    return text
+    const pattern = new RegExp(
+      `(?<![A-Za-z0-9])(${keywordList.map(keywordToRegexPart).join('|')})(?![A-Za-z0-9])`,
+      'gi',
+    )
+    const raw = text
       .split(pattern)
       .filter((chunk) => chunk.length > 0)
-      .map((chunk) => ({ text: chunk, bold: keywordLower.has(chunk.toLowerCase()) }))
+      .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
+    return limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
   }
 
   const expandWhitespace = (tokens: Token[]) => {
@@ -1048,7 +1232,7 @@ const buildResumePdfBlobDocxStyle = (args: {
       if (preset.headerAlign === 'center') {
         pdf.text(line, pageWidth / 2, y, { align: 'center' })
       } else {
-        pdf.text(line, margin, y)
+        pdf.text(line, marginX, y)
       }
       y += size + 4
     }
@@ -1061,7 +1245,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     const { r, g, b } = hexToRgb(preset.accentHex)
     pdf.setDrawColor(r, g, b)
     pdf.setLineWidth(preset.dividerStyle === 'thick' ? 2.25 : 1.25)
-    pdf.line(margin, y, pageWidth - margin, y)
+    pdf.line(marginX, y, pageWidth - marginX, y)
     pdf.setLineWidth(1)
     return y + 18
   }
@@ -1075,9 +1259,9 @@ const buildResumePdfBlobDocxStyle = (args: {
     if (preset.headingStyle === 'shaded') {
       const fill = { r: 238, g: 238, b: 238 }
       pdf.setFillColor(fill.r, fill.g, fill.b)
-      pdf.rect(margin, y - 12, maxWidth, 18, 'F')
+      pdf.rect(marginX, y - 12, maxWidth, 18, 'F')
       setTextColorHex('111111')
-      pdf.text(text, margin + 8, y)
+      pdf.text(text, marginX + 8, y)
       return y + 22
     }
 
@@ -1086,9 +1270,9 @@ const buildResumePdfBlobDocxStyle = (args: {
       pdf.setFillColor(r, g, b)
       // keep it as a compact box starting at margin
       const w = Math.min(maxWidth, pdf.getTextWidth(text) + 16)
-      pdf.rect(margin, y - 12, w, 18, 'F')
+      pdf.rect(marginX, y - 12, w, 18, 'F')
       pdf.setTextColor(255, 255, 255)
-      pdf.text(text, margin + 8, y)
+      pdf.text(text, marginX + 8, y)
       setTextColorHex('111111')
       return y + 22
     }
@@ -1096,21 +1280,21 @@ const buildResumePdfBlobDocxStyle = (args: {
     if (preset.headingStyle === 'bar') {
       const { r, g, b } = hexToRgb(preset.accentHex)
       pdf.setFillColor(r, g, b)
-      pdf.rect(margin, y - 12, 4, 16, 'F')
+      pdf.rect(marginX, y - 12, 4, 16, 'F')
       setTextColorHex('111111')
-      pdf.text(text, margin + 10, y)
+      pdf.text(text, marginX + 10, y)
       return y + 22
     }
 
     // underline / none
     setTextColorHex('111111')
-    pdf.text(text, margin, y)
+    pdf.text(text, marginX, y)
     if (preset.headingStyle === 'underline') {
       y += 6
       const { r, g, b } = hexToRgb(preset.accentHex)
       pdf.setDrawColor(r, g, b)
       pdf.setLineWidth(1.5)
-      pdf.line(margin, y, pageWidth - margin, y)
+      pdf.line(marginX, y, pageWidth - marginX, y)
       pdf.setLineWidth(1)
       return y + PDF_SPACING.sectionHeadingToContent
     }
@@ -1140,13 +1324,13 @@ const buildResumePdfBlobDocxStyle = (args: {
     pdf.setFont(pdfFontFamily, opts.boldLeft ? 'bold' : 'normal')
     pdf.setFontSize(opts.leftSize)
     setTextColorHex(opts.leftColorHex)
-    pdf.text(leftLines[0] || '', margin, y)
+    pdf.text(leftLines[0] || '', marginX, y)
 
     if (opts.right) {
       pdf.setFont(pdfFontFamily, 'normal')
       pdf.setFontSize(opts.rightSize)
       setTextColorHex('555555')
-      pdf.text(opts.right, pageWidth - margin, y, { align: 'right' })
+      pdf.text(opts.right, pageWidth - marginX, y, { align: 'right' })
     }
 
     for (const line of leftLines.slice(1)) {
@@ -1154,7 +1338,7 @@ const buildResumePdfBlobDocxStyle = (args: {
       pdf.setFont(pdfFontFamily, opts.boldLeft ? 'bold' : 'normal')
       pdf.setFontSize(opts.leftSize)
       setTextColorHex(opts.leftColorHex)
-      pdf.text(line, margin, y)
+      pdf.text(line, marginX, y)
     }
 
     return y + 8
@@ -1166,10 +1350,10 @@ const buildResumePdfBlobDocxStyle = (args: {
     pdf.setFont(pdfFontFamily, 'normal')
     pdf.setFontSize(10) // 20 half-points
     setTextColorHex('111111')
-    pdf.text(preset.bulletChar, margin, y)
+    pdf.text(preset.bulletChar, marginX, y)
     y = drawWrappedTokens({
       tokens: buildHighlightedTokens(text),
-      x: margin + 12,
+      x: marginX + 12,
       y,
       maxWidth: maxWidth - 12,
       fontSize: 10,
@@ -1180,7 +1364,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   }
 
   // --- Render (mirrors DOCX order/labels) ---
-  let y = margin
+  let y = marginY
   y = drawHeaderWrapped(fullName, y, preset.pdf.nameSize, true, '111111')
   y += 2
   if (titleLine) y = drawHeaderWrapped(titleLine, y, preset.pdf.titleSize, true, '333333')
@@ -1193,7 +1377,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   if (summary) {
     y = drawWrappedTokens({
       tokens: buildHighlightedTokens(summary),
-      x: margin,
+      x: marginX,
       y,
       maxWidth,
       fontSize: 10.5, // 21 half-points
@@ -1211,7 +1395,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     y = drawWrappedTokens({
       // Skills should be plain (no keyword bolding).
       tokens: [{ text: skillsText, bold: false }],
-      x: margin,
+      x: marginX,
       y,
       maxWidth,
       fontSize: 10,
@@ -1274,7 +1458,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     setTextColorHex('111111')
     for (const line of (pdf.splitTextToSize(degree || ' ', maxWidth) as string[])) {
       y = ensureSpace(y, PDF_SPACING.educationLineHeight)
-      pdf.text(line, margin, y)
+      pdf.text(line, marginX, y)
       y += PDF_SPACING.educationLineHeight
     }
 
@@ -1283,7 +1467,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     setTextColorHex('555555')
     for (const line of (pdf.splitTextToSize(meta || ' ', maxWidth) as string[])) {
       y = ensureSpace(y, PDF_SPACING.educationMetaLineHeight)
-      pdf.text(line, margin, y)
+      pdf.text(line, marginX, y)
       y += PDF_SPACING.educationMetaLineHeight
     }
 
@@ -1496,6 +1680,13 @@ export default function ResumeBuilder() {
   const [draft, setDraft] = useState<ResumeDraft>(baseDraft)
   const [isDraftDirty, setIsDraftDirty] = useState(false)
   const [notes, setNotes] = useState('')
+  const [jobUrl, setJobUrl] = useState(() => {
+    try {
+      return localStorage.getItem('resume_generator_job_url') ?? ''
+    } catch {
+      return ''
+    }
+  })
   const [companyName, setCompanyName] = useState('')
   const [jobTitle, setJobTitle] = useState('')
   const [resumeLanguage, setResumeLanguage] = useState<ResumeLanguage>(() => {
@@ -1516,7 +1707,8 @@ export default function ResumeBuilder() {
         saved === 'Minimal' ||
         saved === 'Executive' ||
         saved === 'Creative' ||
-        saved === 'TrueCircle'
+        saved === 'TrueCircle' ||
+        saved === 'Wide'
       ) {
         return saved
       }
@@ -1541,6 +1733,14 @@ export default function ResumeBuilder() {
       // ignore
     }
   }, [resumeLanguage])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('resume_generator_job_url', jobUrl)
+    } catch {
+      // ignore
+    }
+  }, [jobUrl])
 
   useEffect(() => {
     try {
@@ -1778,6 +1978,20 @@ export default function ResumeBuilder() {
       return
     }
 
+    // Confirm if the job description contains sensitive / constraint keywords.
+    const jdLower = notes.toLowerCase()
+    const warningWords = ['hybrid', 'onsite', 'on-site', 'clearance'] as const
+    const matched = warningWords.filter((w) => jdLower.includes(w))
+    if (matched.length > 0) {
+      const ok = window.confirm(
+        `Your job description contains: ${Array.from(new Set(matched)).join(', ')}.\n\nDo you want to continue generating?`,
+      )
+      if (!ok) {
+        toast('Generation cancelled.')
+        return
+      }
+    }
+
     setIsGenerating(true)
     setError(null)
 
@@ -1869,7 +2083,7 @@ INSTRUCTIONS:
    - Each project item must be ONE sentence and must include ALL of:
      a) a real user story (explicitly name the user persona and goal),
      b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
-     c) the outcome/impact (include metrics if available; otherwise use "(est.)" for estimates).
+     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
    - Each item must be action/outcome oriented and aligned to the target role/JD.
    - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
 1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
@@ -2058,7 +2272,7 @@ If you understand, return the single JSON object now.`,
           ? draftParsed.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
           : []
         const existingProjects = Array.isArray(draftParsed?.projects)
-          ? draftParsed.projects.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
           : []
 
         const needsAchievements = existingAchievements.length === 0
@@ -2097,7 +2311,7 @@ If you understand, return the single JSON object now.`,
               },
               {
                 role: 'user',
-                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; otherwise use \"(est.)\" for estimates).\n- Use measurable outcomes when reasonable; if you must estimate, mark as \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                   repairPayload,
                 )}`,
               },
@@ -2115,7 +2329,7 @@ If you understand, return the single JSON object now.`,
           ? repaired.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
           : []
         const nextProjects = Array.isArray(repaired?.projects)
-          ? repaired.projects.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          ? repaired.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
           : []
 
         if (needsAchievements && nextAchievements.length > 0) draftParsed.keyAchievements = nextAchievements
@@ -2302,7 +2516,7 @@ If you understand, return the single JSON object now.`,
             ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
             : prev.keyAchievements,
           projects: Array.isArray(parsedWithTitles.projects)
-            ? parsedWithTitles.projects.map((s: string) => sanitizeText(s)).filter(Boolean)
+            ? parsedWithTitles.projects.map((s: string) => stripTrailingEstimateTag(sanitizeText(s))).filter(Boolean)
             : prev.projects,
           workHistory,
         }
@@ -2408,42 +2622,37 @@ If you understand, return the single JSON object now.`,
       .join(' | ')
     // Skills are a flat list (no categories).
     const displaySkills = normalizeSkillsForDisplay(draft.skills)
-    const flatKeywords = Array.from(new Set(displaySkills))
-
-    // Expand keyword list to maximize highlighting in bullets:
-    // - include flatKeywords (from skills and grouped items)
-    // - also include component tokens from multi-word phrases (e.g., 'AWS Lambda' -> 'AWS', 'Lambda')
-    // - deduplicate and sort by length desc so longer phrases match before shorter tokens
-    const extraTokens = flatKeywords
-      .map((k) => k.split(/[\s,/\-()]+/).map((t) => t.trim()).filter(Boolean))
-      .flat()
-    const keywordSet = new Set<string>([...flatKeywords.map((k) => k.trim()).filter(Boolean), ...extraTokens.map((k) => k.trim()).filter(Boolean)])
-    const keywordList = Array.from(keywordSet).filter(Boolean).sort((a, b) => b.length - a.length)
-    const experienceRightIndent = 360
-    const rightTabStop = 10080 - experienceRightIndent
+    // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
+    const keywordList = buildImportantHighlightKeywords(displaySkills)
     const preset = getResumeStylePreset(resumeStyle)
+    const experienceRightIndent = 360
+    const docxMarginTwipsX = preset.docxMarginTwipsX ?? preset.docxMarginTwips ?? 1080
+    const pageWidthTwips = preset.docxPageSizeTwips?.width ?? 12240 // default: US Letter (8.5in)
+    const contentWidthTwips = pageWidthTwips - docxMarginTwipsX * 2
+    const rightTabStop = contentWidthTwips - experienceRightIndent
     const fontFamily = preset.fontFamily
     const headingText = (value: string) => (preset.headingUppercase ? value.toUpperCase() : value)
     const headerAlignment = preset.headerAlign === 'center' ? AlignmentType.CENTER : AlignmentType.LEFT
     const headerNameColor = resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
     const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
-    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
       const buildHighlightedRuns = (text: string, size = 21) => {
       if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       if (keywordList.length === 0) {
         return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       }
       // match whole words only to avoid highlighting substrings (e.g., 'git' inside 'digital')
-      const pattern = new RegExp(`\\b(${keywordList.map(escapeRegExp).join('|')})\\b`, 'gi')
-      return text
+      const pattern = new RegExp(
+        `(?<![A-Za-z0-9])(${keywordList.map(keywordToRegexPart).join('|')})(?![A-Za-z0-9])`,
+        'gi',
+      )
+      const raw = text
         .split(pattern)
         .filter((chunk) => chunk.length > 0)
-        .map((chunk) => {
-          const isMatch = keywordList.some(
-            (keyword) => keyword.toLowerCase() === chunk.toLowerCase(),
-          )
-          return new TextRun({ text: chunk, bold: isMatch, size, color: '111111', font: fontFamily })
-        })
+        .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
+
+      const merged = limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
+      return merged.map((t) => new TextRun({ text: t.text, bold: t.bold, size, color: '111111', font: fontFamily }))
     }
     const experienceLine = (
       left: string,
@@ -2589,7 +2798,7 @@ If you understand, return the single JSON object now.`,
       {
         English: {
           summary: 'SUMMARY',
-          skills: 'TECHNICAL SKILLS',
+          skills: 'SKILLS',
           experience: 'EXPERIENCE',
           education: 'EDUCATION',
           achievements: 'KEY ACHIEVEMENTS',
@@ -2627,11 +2836,19 @@ If you understand, return the single JSON object now.`,
         {
           properties: {
             page: {
+              ...(preset.docxPageSizeTwips
+                ? {
+                    size: {
+                      width: preset.docxPageSizeTwips.width,
+                      height: preset.docxPageSizeTwips.height,
+                    },
+                  }
+                : {}),
               margin: {
-                top: 1080,
-                bottom: 1080,
-                left: 1080,
-                right: 1080,
+                top: preset.docxMarginTwipsY ?? preset.docxMarginTwips ?? 1080,
+                bottom: preset.docxMarginTwipsY ?? preset.docxMarginTwips ?? 1080,
+                left: preset.docxMarginTwipsX ?? preset.docxMarginTwips ?? 1080,
+                right: preset.docxMarginTwipsX ?? preset.docxMarginTwips ?? 1080,
               },
             },
           },
@@ -2702,13 +2919,14 @@ If you understand, return the single JSON object now.`,
                     spacing: { after: 60 },
                   }),
                 ]),
-            new Paragraph({ text: '', spacing: { before: 16, after: 40 } }),
             sectionHeading(docxSectionLabels[resumeLanguage].summary),
             new Paragraph({
               children: buildHighlightedRuns(draft.summary, 21),
               alignment: AlignmentType.JUSTIFIED,
               spacing: { after: 140 },
             }),
+            // Add one blank line before the Skills section.
+            new Paragraph({ text: '' }),
             sectionHeading(docxSectionLabels[resumeLanguage].skills),
             new Paragraph({
               // Skills should be plain (no keyword bolding).
@@ -2735,12 +2953,20 @@ If you understand, return the single JSON object now.`,
               new Paragraph({ text: '' }),
             ]),
             sectionHeading(docxSectionLabels[resumeLanguage].education),
-            ...draft.education.map(
-              (edu) =>
+            ...draft.education.flatMap((edu) => {
+              const degreeLine = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
+              const metaLine = [
+                [edu.school, edu.location].filter(Boolean).join(' | '),
+                `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+              ]
+                .filter(Boolean)
+                .join(' | ')
+
+              return [
                 new Paragraph({
                   children: [
                     new TextRun({
-                      text: `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim(),
+                      text: degreeLine,
                       bold: true,
                       size: 21,
                       color: '111111',
@@ -2749,19 +2975,9 @@ If you understand, return the single JSON object now.`,
                   ],
                   spacing: { after: 40 },
                 }),
-            ),
-            ...draft.education.map((edu) =>
-              educationMeta(
-                [
-                  [edu.school, edu.location].filter(Boolean).join(' | '),
-                  `${monthToLabel(edu.start)} - ${
-                    edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)
-                  }`,
-                ]
-                  .filter(Boolean)
-                  .join(' | '),
-              ),
-            ),
+                educationMeta(metaLine),
+              ]
+            }),
             ...(draft.keyAchievements ?? []).map((value) => value.trim()).filter(Boolean).length > 0
               ? [
                   new Paragraph({ text: '', spacing: { after: 80 } }),
@@ -2824,6 +3040,17 @@ If you understand, return the single JSON object now.`,
     const resumeDocxName = `${resumeBaseName}.docx`
     const resumePdfName = `${resumeBaseName}.pdf`
 
+    const jobDescriptionText = (notes ?? '').trim()
+    const jobUrlText = (jobUrl ?? '').trim()
+    const jobDescriptionFileName = sanitizeFileName(
+      `${(companyName || 'Company').trim()} - ${(jobTitle || draft.targetTitle || 'Role').trim()}`,
+      'Job Description',
+    )
+    const jobDescriptionTxtName = `${jobDescriptionFileName}.txt`
+    const jobDescriptionTxtContent = jobUrlText
+      ? `${jobUrlText}\n\n${jobDescriptionText}`
+      : jobDescriptionText
+
     const writeAllFilesToFolder = async (baseDir: FileSystemDirectoryHandle) => {
       const folderHandle = await baseDir.getDirectoryHandle(folderName, { create: true })
       const folderHasPermission = await ensureDirectoryReadWritePermission(folderHandle)
@@ -2850,6 +3077,12 @@ If you understand, return the single JSON object now.`,
       const coverPdfWritable = await coverPdfHandle.createWritable()
       await coverPdfWritable.write(coverPdfBlob)
       await coverPdfWritable.close()
+
+      // Job description TXT (company - job title)
+      const jdHandle = await folderHandle.getFileHandle(jobDescriptionTxtName, { create: true })
+      const jdWritable = await jdHandle.createWritable()
+      await jdWritable.write(new Blob([jobDescriptionTxtContent], { type: 'text/plain;charset=utf-8' }))
+      await jdWritable.close()
     }
 
     try {
@@ -2947,7 +3180,7 @@ If you understand, return the single JSON object now.`,
                   className="rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-xs text-slate-100 focus:border-indigo-400 focus:outline-none"
                 >
                   {(
-                    ['Classic', 'Modern', 'Minimal', 'Executive', 'Creative', 'TrueCircle'] as ResumeStyle[]
+                    ['Classic', 'Modern', 'Minimal', 'Executive', 'Creative', 'TrueCircle', 'Wide'] as ResumeStyle[]
                   ).map((style) => (
                     <option key={style} value={style}>
                       {getResumeStylePreset(style).label}
@@ -3008,6 +3241,18 @@ If you understand, return the single JSON object now.`,
               />
             </label>
           </div>
+          <label className="mt-3 block text-xs font-medium text-slate-300">
+            Job URL <span className="text-slate-500">(optional)</span>
+            <input
+              value={jobUrl}
+              onChange={(event) => {
+                setJobUrl(event.target.value)
+                markUnsaved()
+              }}
+              placeholder="https://..."
+              className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-[13px] text-slate-100 focus:border-indigo-400 focus:outline-none"
+            />
+          </label>
           <textarea
             value={notes}
             onChange={(event) => {
