@@ -1680,13 +1680,11 @@ export default function ResumeBuilder() {
   const [draft, setDraft] = useState<ResumeDraft>(baseDraft)
   const [isDraftDirty, setIsDraftDirty] = useState(false)
   const [notes, setNotes] = useState('')
-  const [jobUrl, setJobUrl] = useState(() => {
-    try {
-      return localStorage.getItem('resume_generator_job_url') ?? ''
-    } catch {
-      return ''
-    }
-  })
+  const [jobQuestions, setJobQuestions] = useState('')
+  const [jobAnswers, setJobAnswers] = useState('')
+  const [isGeneratingAnswers, setIsGeneratingAnswers] = useState(false)
+  const [qaError, setQaError] = useState<string | null>(null)
+  const [jobUrl, setJobUrl] = useState('')
   const [companyName, setCompanyName] = useState('')
   const [jobTitle, setJobTitle] = useState('')
   const [resumeLanguage, setResumeLanguage] = useState<ResumeLanguage>(() => {
@@ -1736,11 +1734,12 @@ export default function ResumeBuilder() {
 
   useEffect(() => {
     try {
-      localStorage.setItem('resume_generator_job_url', jobUrl)
+      localStorage.removeItem('resume_generator_job_url')
+      localStorage.removeItem('resume_generator_job_questions')
     } catch {
       // ignore
     }
-  }, [jobUrl])
+  }, [])
 
   useEffect(() => {
     try {
@@ -1927,12 +1926,148 @@ export default function ResumeBuilder() {
   const handleReset = () => {
     setDraft(baseDraft)
     setNotes('')
+    setJobQuestions('')
+    setJobAnswers('')
+    setQaError(null)
     setCompanyName('')
     setJobTitle('')
     setError(null)
     setIsSaved(false)
     setIsDraftDirty(false)
     setHasGenerated(false)
+  }
+
+  const handleGenerateAnswers = async () => {
+    const questionsText = (jobQuestions ?? '').trim()
+    if (!questionsText) {
+      const msg = 'Please paste job application questions first.'
+      setQaError(msg)
+      toast.error(msg)
+      return
+    }
+
+    const jdText = (notes ?? '').trim()
+    if (jdText.length < 50) {
+      const msg = 'Please add a job description (at least 50 characters) so the answers can be relevant.'
+      setQaError(msg)
+      toast.error(msg)
+      return
+    }
+
+    setIsGeneratingAnswers(true)
+    setQaError(null)
+
+    const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
+    if (!apiKey) {
+      const msg = 'Missing OpenAI API key. Please add it to your environment variables.'
+      setQaError(msg)
+      toast.error(msg)
+      setIsGeneratingAnswers(false)
+      return
+    }
+
+    const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
+
+    const candidateSnapshot = {
+      name: buildCandidateFullName(profile),
+      location: profile?.location ?? '',
+      headline: (draft.targetTitle ?? '').trim(),
+      summary: (draft.summary ?? '').trim(),
+      skills: Array.isArray(draft.skills) ? draft.skills : [],
+      workHistory: Array.isArray(draft.workHistory)
+        ? draft.workHistory.map((w) => ({
+            company: w.company ?? '',
+            title: w.resume_title ?? w.title ?? '',
+            start: w.start ?? '',
+            end: w.end ?? '',
+            location: w.location ?? '',
+            bullets: Array.isArray(w.bullets) ? w.bullets.filter((b) => (b ?? '').trim()) : [],
+          }))
+        : [],
+      education: Array.isArray(draft.education)
+        ? draft.education.map((e) => ({
+            school: e.school ?? '',
+            degree: e.degree ?? '',
+            field: e.field ?? '',
+            start: e.start ?? '',
+            end: e.end ?? '',
+          }))
+        : [],
+    }
+
+    const jobContext = {
+      companyName: (companyName ?? '').trim(),
+      jobTitle: (jobTitle ?? '').trim(),
+      jobUrl: (jobUrl ?? '').trim(),
+      jobDescription: jdText,
+    }
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.3,
+          messages: [
+            {
+              role: 'system',
+              content: `You write high-quality job application answers that are tightly grounded in the provided job details and candidate snapshot.
+
+Rules:
+- Answer in ${resumeLanguage}.
+- Keep answers relevant to the job description and the role.
+- Do not invent facts, metrics, employers, certifications, or tools not present in the candidate snapshot.
+- If a question needs missing info (e.g., salary expectations, notice period), propose a safe template answer with placeholders like [YOUR NUMBER] or [YOUR DATE].
+- Preserve the original question order.
+- Output plain text only (no markdown, no code fences).`,
+            },
+            {
+              role: 'user',
+              content: `JOB CONTEXT:
+${JSON.stringify(jobContext)}
+
+CANDIDATE SNAPSHOT:
+${JSON.stringify(candidateSnapshot)}
+
+QUESTIONS (paste):
+${questionsText}
+
+Return answers in this format for each question:
+Q: <original question>
+A: <answer>
+`,
+            },
+          ],
+        }),
+      })
+
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        const message = data?.error?.message ?? `OpenAI request failed (${response.status}).`
+        throw new Error(message)
+      }
+
+      const content = (data?.choices?.[0]?.message?.content ?? '').toString()
+      const sanitized = content
+        .replace(/^```text\s*/i, '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim()
+
+      if (!sanitized) throw new Error('Empty response from AI.')
+      setJobAnswers(sanitized)
+      toast.success('Generated answers.')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to generate answers.'
+      setQaError(message)
+      toast.error(message)
+    } finally {
+      setIsGeneratingAnswers(false)
+    }
   }
 
   useEffect(() => {
@@ -1965,6 +2100,13 @@ export default function ResumeBuilder() {
 
     if (!jobTitle.trim()) {
       const msg = 'Please enter a job title before generating.'
+      setError(msg)
+      toast.error(msg)
+      return
+    }
+
+    if (!jobUrl.trim()) {
+      const msg = 'Please enter a Job URL before generating.'
       setError(msg)
       toast.error(msg)
       return
@@ -2128,6 +2270,7 @@ Additional rules (apply exactly):
 - Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkills (string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
 - Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
+  - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
 
 - Bullets (strict):
   - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
@@ -2363,6 +2506,46 @@ If you understand, return the single JSON object now.`,
             .replace(/^\s+|\s+$/g, '')
             .replace(/\s+/g, ' ')
 
+        // helper: sanitize multiline text (preserve line breaks)
+        const sanitizeMultilineText = (s: unknown) => {
+          const raw = (s ?? '').toString().replace(/`+/g, '').replace(/\r\n?/g, '\n').trim()
+          if (!raw) return ''
+
+          // Trim each line but keep empty lines; collapse internal whitespace per line.
+          const lines = raw
+            .split('\n')
+            .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+
+          // If there are line breaks but no blank lines, treat each newline as a paragraph break for readability.
+          const hasAnyNewline = lines.length > 1
+          const hasBlankLine = lines.some((l) => l.length === 0)
+          let normalized = lines.join('\n').trim()
+          if (hasAnyNewline && !hasBlankLine) {
+            normalized = normalized.replace(/\n+/g, '\n\n')
+          }
+
+          // If the model returned a single long line, try to add safe breaks around greeting/closing.
+          if (!normalized.includes('\n')) {
+            const greetingMatch = normalized.match(/^.{0,80}?,\s+/)
+            if (greetingMatch && greetingMatch.index === 0) {
+              const cut = greetingMatch[0].length
+              normalized = `${normalized.slice(0, cut).trim()}\n\n${normalized.slice(cut).trim()}`
+            }
+
+            const closingMatch = normalized.match(
+              /\b(Kind regards|Sincerely|Best regards|Regards|Yours sincerely|Yours truly|Thank you|Thanks)\b/i,
+            )
+            if (closingMatch && typeof closingMatch.index === 'number') {
+              const idx = closingMatch.index
+              normalized = `${normalized.slice(0, idx).trim()}\n\n${normalized.slice(idx).trim()}`
+            }
+          }
+
+          // Collapse 3+ newlines down to 2 (single blank line).
+          normalized = normalized.replace(/\n{3,}/g, '\n\n').trim()
+          return normalized
+        }
+
         // helper: infer seniority from title
         const inferSeniority = (title?: string) => {
           if (!title) return 'mid'
@@ -2511,7 +2694,7 @@ If you understand, return the single JSON object now.`,
           summary: parsedWithTitles.summary ? sanitizeText(parsedWithTitles.summary) : prev.summary,
             skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
             skillDisplayLines,
-            coverLetter: parsedWithTitles.coverLetter ? sanitizeText(parsedWithTitles.coverLetter) : prev.coverLetter,
+            coverLetter: parsedWithTitles.coverLetter ? sanitizeMultilineText(parsedWithTitles.coverLetter) : prev.coverLetter,
           keyAchievements: Array.isArray(parsedWithTitles.keyAchievements)
             ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
             : prev.keyAchievements,
@@ -2555,6 +2738,12 @@ If you understand, return the single JSON object now.`,
     }
     if (!jobTitle.trim()) {
       const msg = 'Please enter a job title before saving.'
+      setError(msg)
+      toast.error(msg)
+      return
+    }
+    if (!jobUrl.trim()) {
+      const msg = 'Please enter a Job URL before saving.'
       setError(msg)
       toast.error(msg)
       return
@@ -3242,7 +3431,7 @@ If you understand, return the single JSON object now.`,
             </label>
           </div>
           <label className="mt-3 block text-xs font-medium text-slate-300">
-            Job URL <span className="text-slate-500">(optional)</span>
+            Job URL <span className="text-red-400">*</span>
             <input
               value={jobUrl}
               onChange={(event) => {
@@ -3264,6 +3453,85 @@ If you understand, return the single JSON object now.`,
             className="mt-4 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
           />
           {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
+
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold text-white">Job application questions</p>
+                  <p className="mt-0.5 text-xs text-slate-400">Paste the questions you see on the application form.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleGenerateAnswers}
+                  disabled={isGeneratingAnswers}
+                  className="inline-flex items-center gap-2 rounded-full bg-emerald-500/80 px-4 py-2 text-xs font-semibold text-white transition hover:-translate-y-0.5 hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isGeneratingAnswers ? (
+                    <>
+                      <LoadingSpinner label="Generating answers" />
+                      Generating...
+                    </>
+                  ) : (
+                    <>
+                      <FiZap /> Generate answers
+                    </>
+                  )}
+                </button>
+              </div>
+              <textarea
+                value={jobQuestions}
+                onChange={(event) => {
+                  setJobQuestions(event.target.value)
+                  setQaError(null)
+                }}
+                rows={10}
+                placeholder={'Examples:\n- Why do you want this role?\n- Describe your experience with [X].\n- What is your notice period?'}
+                className="mt-3 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
+              />
+            </div>
+
+            <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4">
+              <div>
+                <p className="text-sm font-semibold text-white">AI answers</p>
+                <p className="mt-0.5 text-xs text-slate-400">Generated using your job description and current resume draft.</p>
+              </div>
+              <textarea
+                value={jobAnswers}
+                readOnly
+                rows={10}
+                placeholder="Click “Generate answers” to fill this box."
+                className="mt-3 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/40 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!jobAnswers.trim()) return
+                    try {
+                      await navigator.clipboard.writeText(jobAnswers)
+                      toast.success('Answers copied.')
+                    } catch {
+                      toast.error('Copy failed.')
+                    }
+                  }}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-400 hover:text-white"
+                >
+                  <FiFileText /> Copy answers
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setJobAnswers('')}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200"
+                >
+                  <FiRefreshCw /> Clear
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {qaError && <p className="mt-3 text-xs text-rose-400">{qaError}</p>}
+
           <div className="mt-3 flex items-center gap-3">
             <button
               type="button"
