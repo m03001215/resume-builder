@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   FiChevronDown,
   FiChevronUp,
@@ -21,6 +21,7 @@ import {
   TextRun,
 } from 'docx'
 import jsPDF from 'jspdf'
+import * as XLSX from 'xlsx'
 import { useAuth } from '../hooks/useAuth'
 import LoadingSpinner from '../components/LoadingSpinner'
 import toast from 'react-hot-toast'
@@ -56,6 +57,17 @@ type ResumeStylePreset = {
     headingSize: number
     bodySize: number
   }
+}
+
+type JobListItem = {
+  id: string
+  companyName: string
+  jobTitle: string
+  jobUrl: string
+  jobDescription: string
+  status: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  message?: string
+  folderName?: string
 }
 
 const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
@@ -1684,6 +1696,12 @@ export default function ResumeBuilder() {
   const [jobAnswers, setJobAnswers] = useState('')
   const [isGeneratingAnswers, setIsGeneratingAnswers] = useState(false)
   const [qaError, setQaError] = useState<string | null>(null)
+  const [jobListItems, setJobListItems] = useState<JobListItem[]>([])
+  const [jobListError, setJobListError] = useState<string | null>(null)
+  const [jobListSourceName, setJobListSourceName] = useState<string | null>(null)
+  const [isBatchGenerating, setIsBatchGenerating] = useState(false)
+  const [batchIndex, setBatchIndex] = useState<number | null>(null)
+  const abortBatchRef = useRef(false)
   const [jobUrl, setJobUrl] = useState('')
   const [companyName, setCompanyName] = useState('')
   const [jobTitle, setJobTitle] = useState('')
@@ -2075,6 +2093,360 @@ A: <answer>
       setDraft(baseDraft)
     }
   }, [baseDraft, isDraftDirty])
+
+  const applyParsedToDraft = (
+    prev: ResumeDraft,
+    args: { parsed: any; parsedWithTitles: any; jobTitleFallback: string },
+  ): ResumeDraft => {
+    const { parsed, parsedWithTitles, jobTitleFallback } = args
+
+    // determine flattened claimed skills and optional display lines
+    let flatSkills: string[] | undefined = undefined
+    const skillDisplayLines: string[] | undefined = undefined
+
+    if (parsedWithTitles?.claimedSkillsByCategory && typeof parsedWithTitles.claimedSkillsByCategory === 'object') {
+      // prefer categorized response
+      const cat = parsedWithTitles.claimedSkillsByCategory as Record<string, string[]>
+      flatSkills = Array.from(new Set((Object.values(cat) ?? []).flat().map((s) => (s ?? '').trim()).filter(Boolean)))
+    } else if (Array.isArray(parsedWithTitles?.claimedSkills)) {
+      // fallback: model returned flat claimedSkills
+      flatSkills = parsedWithTitles.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+    } else if (Array.isArray(parsedWithTitles?.skills)) {
+      // legacy fallback
+      flatSkills = parsedWithTitles.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+    }
+
+    // helper to sanitize text returned from the model (single-line)
+    const sanitizeText = (s: string) =>
+      (s ?? '')
+        .replace(/`+/g, '') // strip inline/backtick code markers
+        .replace(/^\s+|\s+$/g, '')
+        .replace(/\s+/g, ' ')
+
+    // helper: sanitize multiline text (preserve line breaks)
+    const sanitizeMultilineText = (s: unknown) => {
+      const raw = (s ?? '').toString().replace(/`+/g, '').replace(/\r\n?/g, '\n').trim()
+      if (!raw) return ''
+
+      // Trim each line but keep empty lines; collapse internal whitespace per line.
+      const lines = raw
+        .split('\n')
+        .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+
+      // If there are line breaks but no blank lines, treat each newline as a paragraph break for readability.
+      const hasAnyNewline = lines.length > 1
+      const hasBlankLine = lines.some((l) => l.length === 0)
+      let normalized = lines.join('\n').trim()
+      if (hasAnyNewline && !hasBlankLine) {
+        normalized = normalized.replace(/\n+/g, '\n\n')
+      }
+
+      // If the model returned a single long line, try to add safe breaks around greeting/closing.
+      if (!normalized.includes('\n')) {
+        const greetingMatch = normalized.match(/^.{0,80}?,\s+/)
+        if (greetingMatch && greetingMatch.index === 0) {
+          const cut = greetingMatch[0].length
+          normalized = `${normalized.slice(0, cut).trim()}\n\n${normalized.slice(cut).trim()}`
+        }
+
+        const closingMatch = normalized.match(
+          /\b(Kind regards|Sincerely|Best regards|Regards|Yours sincerely|Yours truly|Thank you|Thanks)\b/i,
+        )
+        if (closingMatch && typeof closingMatch.index === 'number') {
+          const idx = closingMatch.index
+          normalized = `${normalized.slice(0, idx).trim()}\n\n${normalized.slice(idx).trim()}`
+        }
+      }
+
+      // Collapse 3+ newlines down to 2 (single blank line).
+      normalized = normalized.replace(/\n{3,}/g, '\n\n').trim()
+      return normalized
+    }
+
+    // helper: infer seniority from title
+    const inferSeniority = (title?: string) => {
+      if (!title) return 'mid'
+      const t = title.toLowerCase()
+      if (/\b(intern|internship|junior|jr\.)\b/.test(t)) return 'junior'
+      if (/\b(senior|sr\.|lead|principal|manager|director|vp|head|staff)\b/.test(t)) return 'senior'
+      return 'mid'
+    }
+
+    // helper: desired bullet count range by seniority
+    const targetRangeFor = (seniority: string) => {
+      switch (seniority) {
+        case 'junior':
+          return [3, 5]
+        case 'senior':
+          return [5, 7]
+        default:
+          return [4, 6]
+      }
+    }
+
+    // helper: split a long bullet into sentence-like parts to create more bullets
+    const splitIntoFragments = (text: string) =>
+      (text ?? '')
+        .split(/(?<=[.!?;])\s+/)
+        .map((s) => s.replace(/[\s\n]+/g, ' ').trim())
+        .filter(Boolean)
+
+    // helper: expand or trim bullets to match desired counts without inventing new claims
+    const normalizeCount = (bullets: string[], title?: string) => {
+      const seniority = inferSeniority(title)
+      const [minCount, maxCount] = targetRangeFor(seniority)
+
+      // sanitize bullets
+      const sanitized = bullets.map((b) => sanitizeText(b)).filter(Boolean)
+
+      // if already within range, return as-is (or trim to max)
+      if (sanitized.length >= minCount && sanitized.length <= maxCount) return sanitized.slice(0, maxCount)
+
+      // if too many, trim to max
+      if (sanitized.length > maxCount) return sanitized.slice(0, maxCount)
+
+      // if too few, try to split long bullets into sentence fragments
+      const expanded: string[] = []
+      for (const b of sanitized) {
+        const parts = splitIntoFragments(b)
+        if (parts.length > 1) {
+          for (const p of parts) {
+            if (expanded.length < maxCount) expanded.push(p)
+          }
+        } else {
+          expanded.push(b)
+        }
+        if (expanded.length >= minCount) break
+      }
+
+      // if still short, try secondary split on ' and ' (conservative)
+      if (expanded.length < minCount) {
+        for (const b of sanitized) {
+          const parts = b.split(/\s+and\s+/i).map((s) => s.trim()).filter(Boolean)
+          if (parts.length > 1) {
+            for (const p of parts) {
+              if (!expanded.includes(p) && expanded.length < maxCount) expanded.push(p)
+            }
+          }
+          if (expanded.length >= minCount) break
+        }
+      }
+
+      // final fallback: repeat existing bullets with conservative, non-fabricated prefix to reach minCount
+      let idx = 0
+      while (expanded.length < minCount && sanitized.length > 0) {
+        const candidate = sanitized[idx % sanitized.length]
+        const variation =
+          candidate.startsWith('Contributed') || candidate.startsWith('Supported')
+            ? candidate
+            : `Contributed to ${candidate.charAt(0).toLowerCase()}${candidate.slice(1)}`
+        if (!expanded.includes(variation)) expanded.push(variation)
+        idx += 1
+        if (idx > sanitized.length * 3) break
+      }
+
+      return expanded.slice(0, maxCount)
+    }
+
+    // deduplicate and normalize bullets for each company
+    // use a globalSeen set to avoid repeating semantically identical bullets across companies
+    const normalize = (s: string) => sanitizeText(s).toLowerCase()
+
+    const globalSeen = new Set<string>()
+
+    const workHistory = prev.workHistory.map((item) => {
+      const next = parsedWithTitles?.workHistory?.find((entry: { id: string }) => entry.id === item.id)
+      const incoming = Array.isArray(next?.bullets) && next.bullets.length > 0 ? next.bullets : item.bullets
+      const nextResumeTitle =
+        typeof next?.resumeTitle === 'string' && next.resumeTitle.trim() ? sanitizeText(next.resumeTitle) : undefined
+      const localSeen = new Set<string>()
+      const deduped: string[] = []
+
+      for (const raw of incoming.map((b: string) => (b ?? '').trim()).filter(Boolean)) {
+        const b = sanitizeText(raw)
+        const key = normalize(b)
+
+        if (localSeen.has(key) || globalSeen.has(key)) {
+          // attempt a light role-based variation if possible (do not invent companies)
+          const roleForPrefix = item.resume_title
+          if (roleForPrefix) {
+            // only add role prefix if the bullet doesn't already appear role-prefixed
+            if (!/^as a\s+/i.test(b)) {
+              const rolePrefix = `As a ${roleForPrefix}, `
+              const modified = rolePrefix + b.charAt(0).toLowerCase() + b.slice(1)
+              const modKey = normalize(modified)
+              if (!localSeen.has(modKey) && !globalSeen.has(modKey)) {
+                localSeen.add(modKey)
+                globalSeen.add(modKey)
+                deduped.push(modified)
+                continue
+              }
+            }
+          }
+          // skip duplicate if no safe variation can be produced
+          continue
+        }
+
+        localSeen.add(key)
+        globalSeen.add(key)
+        deduped.push(b)
+      }
+
+      const finalBullets = normalizeCount(deduped.length > 0 ? deduped : item.bullets, item.resume_title)
+      return {
+        ...item,
+        // Never fall back to saved company-history titles in the generated resume output.
+        // If the model didn't provide a resumeTitle for this entry, use the generated targetTitle/jobTitle.
+        resume_title:
+          nextResumeTitle ??
+          item.resume_title ??
+          sanitizeText(parsed?.targetTitle || jobTitleFallback || '') ??
+          '',
+        bullets: finalBullets,
+      }
+    })
+
+    return {
+      ...prev,
+      targetTitle: parsedWithTitles?.targetTitle ? sanitizeText(parsedWithTitles.targetTitle) : prev.targetTitle,
+      summary: parsedWithTitles?.summary ? sanitizeText(parsedWithTitles.summary) : prev.summary,
+      skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
+      skillDisplayLines,
+      coverLetter: parsedWithTitles?.coverLetter ? sanitizeMultilineText(parsedWithTitles.coverLetter) : prev.coverLetter,
+      keyAchievements: Array.isArray(parsedWithTitles?.keyAchievements)
+        ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
+        : prev.keyAchievements,
+      projects: Array.isArray(parsedWithTitles?.projects)
+        ? parsedWithTitles.projects.map((s: string) => stripTrailingEstimateTag(sanitizeText(s))).filter(Boolean)
+        : prev.projects,
+      workHistory,
+    }
+  }
+
+  const parseJobListFile = async (file: File): Promise<JobListItem[]> => {
+    const normalizeKey = (raw: string) =>
+      (raw ?? '')
+        .toString()
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '_')
+        .replace(/[^a-z0-9_]/g, '')
+
+    const pick = (row: Record<string, any>, keys: string[]) => {
+      for (const k of keys) {
+        const v = row[k]
+        if (typeof v === 'string' && v.trim()) return v.trim()
+        if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+      }
+      return ''
+    }
+
+    const toItem = (row: Record<string, any>, idx: number): JobListItem => {
+      const company = pick(row, ['company_name', 'company', 'employer'])
+      const title = pick(row, ['job_title', 'title', 'role', 'position'])
+      const url = pick(row, ['job_url', 'url', 'link'])
+      const jd = pick(row, ['job_description', 'description', 'jd', 'notes'])
+      const id = (globalThis.crypto as unknown as { randomUUID?: () => string })?.randomUUID?.() ?? `job_${Date.now()}_${idx}`
+      return {
+        id,
+        companyName: company,
+        jobTitle: title,
+        jobUrl: url,
+        jobDescription: jd,
+        status: 'pending',
+      }
+    }
+
+    const parseCsv = (text: string) => {
+      const rows: string[][] = []
+      let row: string[] = []
+      let field = ''
+      let inQuotes = false
+
+      const pushField = () => {
+        row.push(field)
+        field = ''
+      }
+      const pushRow = () => {
+        // skip empty trailing row
+        if (row.length === 1 && !row[0]?.trim()) {
+          row = []
+          return
+        }
+        rows.push(row)
+        row = []
+      }
+
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i]
+        const next = text[i + 1]
+        if (inQuotes) {
+          if (ch === '"' && next === '"') {
+            field += '"'
+            i++
+          } else if (ch === '"') {
+            inQuotes = false
+          } else {
+            field += ch
+          }
+          continue
+        }
+
+        if (ch === '"') {
+          inQuotes = true
+          continue
+        }
+        if (ch === ',') {
+          pushField()
+          continue
+        }
+        if (ch === '\n') {
+          pushField()
+          pushRow()
+          continue
+        }
+        if (ch === '\r') continue
+        field += ch
+      }
+      pushField()
+      if (row.length > 0) pushRow()
+      return rows
+    }
+
+    const ext = (file.name.split('.').pop() ?? '').toLowerCase()
+    if (ext === 'csv') {
+      const text = await file.text()
+      const parsed = parseCsv(text)
+      const header = (parsed[0] ?? []).map(normalizeKey)
+      const items: JobListItem[] = []
+      for (let i = 1; i < parsed.length; i++) {
+        const cells = parsed[i]
+        const rowObj: Record<string, any> = {}
+        for (let c = 0; c < header.length; c++) {
+          rowObj[header[c]] = (cells[c] ?? '').toString()
+        }
+        items.push(toItem(rowObj, i - 1))
+      }
+      return items.filter((it) => it.companyName || it.jobTitle || it.jobUrl || it.jobDescription)
+    }
+
+    if (ext === 'xlsx' || ext === 'xls') {
+      const buf = await file.arrayBuffer()
+      const wb = XLSX.read(buf, { type: 'array' })
+      const sheetName = wb.SheetNames?.[0]
+      if (!sheetName) return []
+      const sheet = wb.Sheets[sheetName]
+      const json = XLSX.utils.sheet_to_json(sheet, { defval: '' }) as Record<string, any>[]
+      const normalized = json.map((row) => {
+        const out: Record<string, any> = {}
+        for (const [k, v] of Object.entries(row)) out[normalizeKey(k)] = v
+        return out
+      })
+      return normalized.map((r, idx) => toItem(r, idx)).filter((it) => it.companyName || it.jobTitle || it.jobUrl || it.jobDescription)
+    }
+
+    throw new Error('Unsupported file type. Please upload a .csv or .xlsx file.')
+  }
 
   const handleGenerate = async () => {
     if (!companies || companies.length === 0) {
@@ -2482,228 +2854,7 @@ If you understand, return the single JSON object now.`,
 
       const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(parsed))
 
-      updateDraft((prev) => {
-        // determine flattened claimed skills and optional display lines
-        let flatSkills: string[] | undefined = undefined
-        const skillDisplayLines: string[] | undefined = undefined
-
-        if (parsedWithTitles.claimedSkillsByCategory && typeof parsedWithTitles.claimedSkillsByCategory === 'object') {
-          // prefer categorized response
-          const cat = parsedWithTitles.claimedSkillsByCategory as Record<string, string[]>
-          flatSkills = Array.from(new Set((Object.values(cat) ?? []).flat().map((s) => (s ?? '').trim()).filter(Boolean)))
-        } else if (Array.isArray(parsedWithTitles.claimedSkills)) {
-          // fallback: model returned flat claimedSkills
-          flatSkills = parsedWithTitles.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
-        } else if (Array.isArray(parsedWithTitles.skills)) {
-          // legacy fallback
-          flatSkills = parsedWithTitles.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
-        }
-
-        // helper to sanitize text returned from the model
-        const sanitizeText = (s: string) =>
-          (s ?? '')
-            .replace(/`+/g, '') // strip inline/backtick code markers
-            .replace(/^\s+|\s+$/g, '')
-            .replace(/\s+/g, ' ')
-
-        // helper: sanitize multiline text (preserve line breaks)
-        const sanitizeMultilineText = (s: unknown) => {
-          const raw = (s ?? '').toString().replace(/`+/g, '').replace(/\r\n?/g, '\n').trim()
-          if (!raw) return ''
-
-          // Trim each line but keep empty lines; collapse internal whitespace per line.
-          const lines = raw
-            .split('\n')
-            .map((line) => line.replace(/[ \t]+/g, ' ').trim())
-
-          // If there are line breaks but no blank lines, treat each newline as a paragraph break for readability.
-          const hasAnyNewline = lines.length > 1
-          const hasBlankLine = lines.some((l) => l.length === 0)
-          let normalized = lines.join('\n').trim()
-          if (hasAnyNewline && !hasBlankLine) {
-            normalized = normalized.replace(/\n+/g, '\n\n')
-          }
-
-          // If the model returned a single long line, try to add safe breaks around greeting/closing.
-          if (!normalized.includes('\n')) {
-            const greetingMatch = normalized.match(/^.{0,80}?,\s+/)
-            if (greetingMatch && greetingMatch.index === 0) {
-              const cut = greetingMatch[0].length
-              normalized = `${normalized.slice(0, cut).trim()}\n\n${normalized.slice(cut).trim()}`
-            }
-
-            const closingMatch = normalized.match(
-              /\b(Kind regards|Sincerely|Best regards|Regards|Yours sincerely|Yours truly|Thank you|Thanks)\b/i,
-            )
-            if (closingMatch && typeof closingMatch.index === 'number') {
-              const idx = closingMatch.index
-              normalized = `${normalized.slice(0, idx).trim()}\n\n${normalized.slice(idx).trim()}`
-            }
-          }
-
-          // Collapse 3+ newlines down to 2 (single blank line).
-          normalized = normalized.replace(/\n{3,}/g, '\n\n').trim()
-          return normalized
-        }
-
-        // helper: infer seniority from title
-        const inferSeniority = (title?: string) => {
-          if (!title) return 'mid'
-          const t = title.toLowerCase()
-          if (/\b(intern|internship|junior|jr\.)\b/.test(t)) return 'junior'
-          if (/\b(senior|sr\.|lead|principal|manager|director|vp|head|staff)\b/.test(t)) return 'senior'
-          return 'mid'
-        }
-
-        // helper: desired bullet count range by seniority
-        const targetRangeFor = (seniority: string) => {
-          switch (seniority) {
-            case 'junior':
-              return [3, 5]
-            case 'senior':
-              return [5, 7]
-            default:
-              return [4, 6]
-          }
-        }
-
-        // helper: split a long bullet into sentence-like parts to create more bullets
-        const splitIntoFragments = (text: string) =>
-          (text ?? '')
-            .split(/(?<=[.!?;])\s+/)
-            .map((s) => s.replace(/[\s\n]+/g, ' ').trim())
-            .filter(Boolean)
-
-        // helper: expand or trim bullets to match desired counts without inventing new claims
-        const normalizeCount = (bullets: string[], title?: string) => {
-          const seniority = inferSeniority(title)
-          const [minCount, maxCount] = targetRangeFor(seniority)
-
-          // sanitize bullets
-          const sanitized = bullets.map((b) => sanitizeText(b)).filter(Boolean)
-
-          // if already within range, return as-is (or trim to max)
-          if (sanitized.length >= minCount && sanitized.length <= maxCount) return sanitized.slice(0, maxCount)
-
-          // if too many, trim to max
-          if (sanitized.length > maxCount) return sanitized.slice(0, maxCount)
-
-          // if too few, try to split long bullets into sentence fragments
-          const expanded: string[] = []
-          for (const b of sanitized) {
-            const parts = splitIntoFragments(b)
-            if (parts.length > 1) {
-              for (const p of parts) {
-                if (expanded.length < maxCount) expanded.push(p)
-              }
-            } else {
-              expanded.push(b)
-            }
-            if (expanded.length >= minCount) break
-          }
-
-          // if still short, try secondary split on ' and ' (conservative)
-          if (expanded.length < minCount) {
-            for (const b of sanitized) {
-              const parts = b.split(/\s+and\s+/i).map((s) => s.trim()).filter(Boolean)
-              if (parts.length > 1) {
-                for (const p of parts) {
-                  if (!expanded.includes(p) && expanded.length < maxCount) expanded.push(p)
-                }
-              }
-              if (expanded.length >= minCount) break
-            }
-          }
-
-          // final fallback: repeat existing bullets with conservative, non-fabricated prefix to reach minCount
-          let idx = 0
-          while (expanded.length < minCount && sanitized.length > 0) {
-            const candidate = sanitized[idx % sanitized.length]
-            const variation = candidate.startsWith('Contributed') || candidate.startsWith('Supported') ? candidate : `Contributed to ${candidate.charAt(0).toLowerCase()}${candidate.slice(1)}`
-            if (!expanded.includes(variation)) expanded.push(variation)
-            idx += 1
-            if (idx > sanitized.length * 3) break
-          }
-
-          return expanded.slice(0, maxCount)
-        }
-
-        // deduplicate and normalize bullets for each company
-        // use a globalSeen set to avoid repeating semantically identical bullets across companies
-        const normalize = (s: string) => sanitizeText(s).toLowerCase()
-
-        const globalSeen = new Set<string>()
-
-        const workHistory = prev.workHistory.map((item) => {
-          const next = parsedWithTitles.workHistory?.find((entry: { id: string }) => entry.id === item.id)
-          const incoming = Array.isArray(next?.bullets) && next.bullets.length > 0 ? next.bullets : item.bullets
-          const nextResumeTitle =
-            typeof next?.resumeTitle === 'string' && next.resumeTitle.trim()
-              ? sanitizeText(next.resumeTitle)
-              : undefined
-          const localSeen = new Set<string>()
-          const deduped: string[] = []
-
-          for (const raw of incoming.map((b: string) => (b ?? '').trim()).filter(Boolean)) {
-            const b = sanitizeText(raw)
-            const key = normalize(b)
-
-            if (localSeen.has(key) || globalSeen.has(key)) {
-              // attempt a light role-based variation if possible (do not invent companies)
-              const roleForPrefix = item.resume_title
-              if (roleForPrefix) {
-                // only add role prefix if the bullet doesn't already appear role-prefixed
-                if (!/^as a\s+/i.test(b)) {
-                  const rolePrefix = `As a ${roleForPrefix}, `
-                  const modified = rolePrefix + b.charAt(0).toLowerCase() + b.slice(1)
-                  const modKey = normalize(modified)
-                  if (!localSeen.has(modKey) && !globalSeen.has(modKey)) {
-                    localSeen.add(modKey)
-                    globalSeen.add(modKey)
-                    deduped.push(modified)
-                    continue
-                  }
-                }
-              }
-              // skip duplicate if no safe variation can be produced
-              continue
-            }
-
-            localSeen.add(key)
-            globalSeen.add(key)
-            deduped.push(b)
-          }
-
-          const finalBullets = normalizeCount(deduped.length > 0 ? deduped : item.bullets, item.resume_title)
-          return {
-            ...item,
-            // Never fall back to saved company-history titles in the generated resume output.
-            // If the model didn't provide a resumeTitle for this entry, use the generated targetTitle/jobTitle.
-            resume_title:
-              nextResumeTitle ??
-              item.resume_title ??
-              sanitizeText(parsed.targetTitle || '') ??
-              '',
-            bullets: finalBullets,
-          }
-        })
-
-        return {
-          ...prev,
-          targetTitle: parsedWithTitles.targetTitle ? sanitizeText(parsedWithTitles.targetTitle) : prev.targetTitle,
-          summary: parsedWithTitles.summary ? sanitizeText(parsedWithTitles.summary) : prev.summary,
-            skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
-            skillDisplayLines,
-            coverLetter: parsedWithTitles.coverLetter ? sanitizeMultilineText(parsedWithTitles.coverLetter) : prev.coverLetter,
-          keyAchievements: Array.isArray(parsedWithTitles.keyAchievements)
-            ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
-            : prev.keyAchievements,
-          projects: Array.isArray(parsedWithTitles.projects)
-            ? parsedWithTitles.projects.map((s: string) => stripTrailingEstimateTag(sanitizeText(s))).filter(Boolean)
-            : prev.projects,
-          workHistory,
-        }
-      })
+      updateDraft((prev) => applyParsedToDraft(prev, { parsed, parsedWithTitles, jobTitleFallback: jobTitle }))
       setHasGenerated(true)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
@@ -2713,6 +2864,519 @@ If you understand, return the single JSON object now.`,
       setHasGenerated(true)
     } finally {
       setIsGenerating(false)
+    }
+  }
+
+  const generateDraftForJobItem = async (base: ResumeDraft, item: JobListItem) => {
+    const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
+    if (!apiKey) {
+      throw new Error('Missing OpenAI API key. Please add it to your environment variables.')
+    }
+
+    const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
+    const getYear = (value?: string) => {
+      if (!value) return undefined
+      const match = value.match(/\d{4}/)
+      return match ? Number(match[0]) : undefined
+    }
+    const startYears = base.workHistory
+      .map((wh) => getYear(wh.start))
+      .filter((year): year is number => typeof year === 'number')
+    const endYears = base.workHistory
+      .map((wh) => (wh.end === 'Present' ? new Date().getFullYear() : getYear(wh.end)))
+      .filter((year): year is number => typeof year === 'number')
+    const careerStartYear = startYears.length > 0 ? Math.min(...startYears) : undefined
+    const careerEndYear = endYears.length > 0 ? Math.max(...endYears) : undefined
+
+    const jobTitleInput = (item.jobTitle ?? '').trim()
+    const notesInput = (item.jobDescription ?? '').trim()
+
+    const payload = {
+      candidateName: buildCandidateFullName(profile),
+      resumeLanguage,
+      careerStartYear,
+      careerEndYear,
+      summary: base.summary,
+      skills: base.skills,
+      workHistory: base.workHistory.map((wh) => ({
+        id: wh.id,
+        company: wh.company,
+        title: wh.title,
+        start: wh.start,
+        end: wh.end,
+        location: wh.location,
+      })),
+      education: base.education,
+      notes: notesInput,
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.4,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkills, workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+          },
+          {
+            role: 'user',
+            content: `Using the following candidate payload and job description, generate a human-written, technically credible JSON resume. Keep workHistory IDs intact: ${JSON.stringify(
+              payload,
+            )}
+
+INSTRUCTIONS:
+0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
+   - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
+0.1 Target role focus (role-agnostic): The resume must read like a "${jobTitleInput}" resume first.
+   - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
+   - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${jobTitleInput}" and are supported by the payload + job description.
+   - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
+   - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
+0.2 Experience titles (required):
+   - For EVERY workHistory entry, generate a "resumeTitle" that is tailored to the target job role/JD.
+   - Do NOT reuse the original stored company-history title verbatim unless it already matches the target role; prefer role-aligned mapping (e.g., "Software Engineer" -> "Backend Engineer" for a backend JD).
+   - Keep resumeTitle truthful (do not inflate seniority); but word it to align with the target role.
+0.3 Completeness (required):
+   - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
+   - Every returned workHistory entry MUST include a non-empty resumeTitle string.
+0.4 Key Achievements + Projects (required):
+   - keyAchievements MUST be a non-empty array with 4–6 items.
+   - projects MUST be an array with EXACTLY 3 items.
+   - Each project must be extremely relevant to the job description.
+   - Each project item must be ONE sentence and must include ALL of:
+     a) a real user story (explicitly name the user persona and goal),
+     b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
+     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
+   - Each item must be action/outcome oriented and aligned to the target role/JD.
+   - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
+1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
+2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
+3. Do not summarize or paraphrase the job description before processing.
+4. Scan the full job description line-by-line and extract as many keywords and key tech stacks as possible, capturing them exactly as written.
+5. Collect keywords from the job title, responsibilities, required qualifications, preferred qualifications, nice-to-have sections, and any architecture, scale, or platform descriptions embedded in the text.
+6. Classify every extracted keyword into logical categories based on what the job description actually mentions (e.g. languages, frameworks, databases, cloud, DevOps, testing, methodologies, etc.). Use categories that match the job domain.
+7. Do not normalize, replace, or infer technologies during extraction.
+8. All keywords must initially remain literal to the job description wording.
+9. Assign a priority to each keyword:
+   a. P1 (Critical): appears in the job title, required section, or multiple times
+   b. P2 (Important): appears once or in preferred sections
+   c. P3 (Supporting): implied by responsibilities or architectural language
+10. The original job-description wording is mandatory and must never be replaced.
+11. Do not substitute one technology for another.
+12. Do not generalize platforms.
+13. Directly inject extracted job-description keywords and tech stacks into the resume.
+14. Maximize keyword coverage while maintaining logical consistency with the original resume.
+15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure.
+16. Never invent new roles, companies, job titles, or project domains.
+17. Generate a target title that closely mirrors the job description title and aligns with the candidate's career progression.
+18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. It must include the exact total years of full-time professional experience computed from payload.careerStartYear and payload.careerEndYear (for example: "10 years"). Do not round up; if dates are missing or ambiguous, state "Years of experience: unknown" and add a brief factual explanation in the 'notes' field.
+19. The summary must reference relevant scale, performance, architecture, and business impact using keywords from the job description.
+20. The summary must not include company names or personal pronouns.
+21. Use past tense for previous roles and present tense only for the current role.
+22. Each role must contain 5-7 bullets and should include at least 2 real metrics results.
+23. Each bullet must be one sentence only. No paragraphs.
+24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
+25. The bullets should be outcome-driven and should include real metrics results as much as possible.
+27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
+28. Include 12–20 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
+29. All job-description technologies must appear in both Skills and Experience sections.
+30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
+31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
+32. Provide a job match score between 95 and 99 based on how well the tailored resume aligns with the job requirements.
+
+Additional rules (apply exactly):
+
+- Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
+
+- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkills (string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
+
+- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
+  - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
+
+- Bullets (strict):
+  - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
+  - Each role must contain 5-7 bullets.
+  - Bullets must be action-oriented, concrete, mention technologies when relevant, and align with the provided job description (payload.notes).
+  - Follow the structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
+  - Do NOT include company names or date ranges inside bullets.
+  - Prefer measurable outcomes in MOST bullets, but never fabricate numbers; use placeholders when necessary and record them in 'notes'.
+  - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
+
+- Skills:
+  - Output claimedSkills as a flat array of strings (no categories).
+  - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
+  - All job-description technologies (P1/P2) must appear in both Skills and Experience sections.
+
+- Honesty & scope:
+  - Do NOT fabricate roles, responsibilities, metrics, ownership, or seniority beyond what the payload supports.
+  - Infer seniority conservatively from title and timeline; produce role-appropriate technical depth only when plausible.
+  - Cross-check each technology against the role's dates; only claim production use of a technology if it was widely available during the role and the payload includes supporting evidence. Otherwise describe exposure conservatively (e.g., evaluated, prototyped, supported) and record the limitation in the 'notes' field.
+
+- Formatting & validation:
+  - Ensure the returned JSON parses cleanly.
+  - Validate that every bullet meets the 25-word minimum, each role has 5-7 bullets, bullets are single-sentence and unique, and that required P1/P2 keywords are present in logical contexts.
+  - If any rule cannot be satisfied, still return JSON but set 'notes' to a short factual explanation of the limitation and include the jobMatchScore reflecting the constraint.
+
+If you understand, return the single JSON object now.`,
+          },
+        ],
+      }),
+    })
+
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      const message = data?.error?.message ?? `OpenAI request failed (${response.status}).`
+      throw new Error(message)
+    }
+
+    const content = data?.choices?.[0]?.message?.content ?? '{}'
+    const sanitizedContent = content
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim()
+    const parsed = JSON.parse(sanitizedContent)
+
+    const sanitizeModelText = (s: unknown) =>
+      (s ?? '')
+        .toString()
+        .replace(/`+/g, '')
+        .replace(/^\s+|\s+$/g, '')
+        .replace(/\s+/g, ' ')
+
+    const parseModelJson = (raw: unknown) => {
+      const content = (raw ?? '').toString()
+      const cleaned = content
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim()
+      return JSON.parse(cleaned)
+    }
+
+    const ensureResumeTitles = async (draftParsed: any) => {
+      const requestedIds = payload.workHistory.map((w) => w.id)
+      const entries = Array.isArray(draftParsed?.workHistory) ? draftParsed.workHistory : []
+      const byId = new Map<string, any>()
+      for (const entry of entries) {
+        if (entry && typeof entry.id === 'string') byId.set(entry.id, entry)
+      }
+      const missingIds = requestedIds.filter((id) => {
+        const rt = byId.get(id)?.resumeTitle
+        return typeof rt !== 'string' || !rt.trim()
+      })
+
+      if (missingIds.length === 0) return draftParsed
+
+      const repairPayload = {
+        targetJobTitle: jobTitleInput,
+        targetTitle: draftParsed?.targetTitle ?? '',
+        jobDescription: notesInput,
+        workHistory: payload.workHistory.map((w) => ({
+          id: w.id,
+          originalTitle: w.title,
+          company: w.company,
+          start: w.start,
+          end: w.end,
+          location: w.location,
+        })),
+        missingIds,
+      }
+
+      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            {
+              role: 'system',
+              content: 'Output ONLY valid JSON (no markdown). Return: { workHistory: [{ id, resumeTitle }] } and nothing else.',
+            },
+            {
+              role: 'user',
+              content: `Generate role-aligned resumeTitle values for the missing workHistory ids. Titles must be tailored to the target job role, truthful, and not inflated in seniority. Do not invent new companies or change ids. Return one entry per missing id.\n\nPayload:\n${JSON.stringify(
+                repairPayload,
+              )}`,
+            },
+          ],
+        }),
+      })
+
+      const repairData = await repairResponse.json().catch(() => null)
+      if (!repairResponse.ok) {
+        return draftParsed
+      }
+
+      const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+      const repairParsed = parseModelJson(repairContent)
+      const repairs = Array.isArray(repairParsed?.workHistory) ? repairParsed.workHistory : []
+      for (const r of repairs) {
+        if (!r || typeof r.id !== 'string') continue
+        if (!missingIds.includes(r.id)) continue
+        const rt = sanitizeModelText(r.resumeTitle)
+        if (!rt.trim()) continue
+        const existing = byId.get(r.id) ?? { id: r.id }
+        byId.set(r.id, { ...existing, resumeTitle: rt })
+      }
+
+      draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(draftParsed?.targetTitle ?? jobTitleInput) })
+      return draftParsed
+    }
+
+    const ensureProjectsAndAchievements = async (draftParsed: any) => {
+      const existingAchievements = Array.isArray(draftParsed?.keyAchievements)
+        ? draftParsed.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+        : []
+      const existingProjects = Array.isArray(draftParsed?.projects)
+        ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
+        : []
+
+      const needsAchievements = existingAchievements.length === 0
+      const needsProjects = existingProjects.length === 0
+      if (!needsAchievements && !needsProjects) return draftParsed
+
+      const repairPayload = {
+        resumeLanguage,
+        targetJobTitle: jobTitleInput,
+        targetTitle: draftParsed?.targetTitle ?? '',
+        jobDescription: notesInput,
+        summary: draftParsed?.summary ?? payload.summary,
+        skills: draftParsed?.claimedSkills ?? payload.skills,
+        workHistory: (draftParsed?.workHistory ?? payload.workHistory).map((w: any) => ({
+          id: w.id,
+          resumeTitle: w.resumeTitle ?? w.title ?? '',
+          company: w.company ?? '',
+          bullets: w.bullets ?? [],
+        })),
+      }
+
+      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.3,
+          messages: [
+            {
+              role: 'system',
+              content: 'Output ONLY valid JSON (no markdown). Return: { keyAchievements: string[], projects: string[] } and nothing else.',
+            },
+            {
+              role: 'user',
+              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                repairPayload,
+              )}`,
+            },
+          ],
+        }),
+      })
+
+      const repairData = await repairResponse.json().catch(() => null)
+      if (!repairResponse.ok) return draftParsed
+
+      const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+      const repaired = parseModelJson(repairContent)
+
+      const nextAchievements = Array.isArray(repaired?.keyAchievements)
+        ? repaired.keyAchievements.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+        : []
+      const nextProjects = Array.isArray(repaired?.projects)
+        ? repaired.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
+        : []
+
+      if (needsAchievements && nextAchievements.length > 0) draftParsed.keyAchievements = nextAchievements
+      if (needsProjects && nextProjects.length > 0) draftParsed.projects = nextProjects
+      return draftParsed
+    }
+
+    const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(parsed))
+    return applyParsedToDraft(base, { parsed, parsedWithTitles, jobTitleFallback: jobTitleInput })
+  }
+
+  const handleJobListFileSelected = async (file?: File | null) => {
+    if (!file) return
+    setJobListError(null)
+    try {
+      const items = await parseJobListFile(file)
+      if (!items || items.length === 0) {
+        setJobListError('No rows found. Expected columns: company_name, job_title, job_url, job_description.')
+        setJobListItems([])
+        setJobListSourceName(file.name ?? null)
+        return
+      }
+      setJobListItems(items)
+      setJobListSourceName(file.name ?? null)
+      toast.success(`Loaded ${items.length} job(s).`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to read job list file.'
+      setJobListError(msg)
+      setJobListItems([])
+      setJobListSourceName(file.name ?? null)
+      toast.error(msg)
+    }
+  }
+
+  const exportJobListResultsXlsx = () => {
+    if (!jobListItems || jobListItems.length === 0) {
+      toast.error('No jobs loaded.')
+      return
+    }
+
+    // Browsers don't expose absolute file system paths.
+    // Best-possible "full path" is: <selected download folder name>/<generated subfolder>.
+    const downloadFolderLabel = (() => {
+      const fromState = (downloadHandleName ?? '').trim()
+      if (fromState) return fromState
+      const fromHandle = ((downloadHandle as unknown as { name?: string } | null)?.name ?? '').toString().trim()
+      if (fromHandle) return fromHandle
+      return 'selected-folder'
+    })()
+
+    const header = ['company_name', 'job_title', 'job_url', 'job_description', 'saved_folder', 'status', 'message'] as const
+    const data = jobListItems.map((it) => [
+      it.companyName ?? '',
+      it.jobTitle ?? '',
+      it.jobUrl ?? '',
+      it.jobDescription ?? '',
+      it.folderName ? `${downloadFolderLabel}\\${it.folderName}` : '',
+      it.status,
+      it.message ?? '',
+    ])
+
+    const ws = XLSX.utils.aoa_to_sheet([Array.from(header), ...data])
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'results')
+
+    const base = (jobListSourceName ?? 'job-list')
+      .replace(/\.[^/.]+$/g, '') // strip extension
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .trim()
+    const outName = `${base || 'job-list'}.results.xlsx`
+
+    const out = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer
+    const blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = outName
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    toast.success(`Downloaded ${outName}`)
+  }
+
+  const handleBatchStop = () => {
+    abortBatchRef.current = true
+    toast('Stopping after current item…')
+  }
+
+  const handleBatchGenerateAndDownload = async () => {
+    if (isBatchGenerating) return
+    if (!downloadHandle) {
+      toast.error('Please choose the folder which saves resume and cover letter')
+      return
+    }
+    const hasPermission = await ensureDirectoryReadWritePermission(downloadHandle)
+    if (!hasPermission) {
+      toast.error('Please allow write access to the selected folder, or choose the folder again.')
+      return
+    }
+    if (!profile) {
+      toast.error('Missing profile.')
+      return
+    }
+    if (!jobListItems || jobListItems.length === 0) {
+      toast.error('Please upload a job list file first.')
+      return
+    }
+
+    abortBatchRef.current = false
+    setIsBatchGenerating(true)
+    setBatchIndex(null)
+    setJobListError(null)
+
+    // Preserve the current draft & form state.
+    const draftSnapshot = draft
+    const prevCompany = companyName
+    const prevTitle = jobTitle
+    const prevUrl = jobUrl
+    const prevNotes = notes
+
+    try {
+      for (let i = 0; i < jobListItems.length; i++) {
+        if (abortBatchRef.current) break
+
+        const item = jobListItems[i]
+        setBatchIndex(i)
+        setJobListItems((prev) =>
+          prev.map((x) => (x.id === item.id ? { ...x, status: 'running', message: undefined } : x)),
+        )
+
+        const company = (item.companyName ?? '').trim()
+        const title = (item.jobTitle ?? '').trim()
+        const url = (item.jobUrl ?? '').trim()
+        const jd = (item.jobDescription ?? '').trim()
+
+        const fail = (message: string) => {
+          setJobListItems((prev) => prev.map((x) => (x.id === item.id ? { ...x, status: 'failed', message } : x)))
+        }
+
+        if (!company || !title || !url) {
+          fail('Missing required fields (company_name, job_title, job_url).')
+          continue
+        }
+        if (jd.length < 100) {
+          fail('Job description too short (< 100 chars).')
+          continue
+        }
+
+        try {
+          // Generate using the current draft as base for every job (preserves your existing logic).
+          const generatedDraft = await generateDraftForJobItem(draftSnapshot, item)
+
+          // Download/write materials for this job
+          const { folderName } = await writeBundleToFolder(downloadHandle, {
+            draft: generatedDraft,
+            companyName: company,
+            jobTitle: title,
+            jobUrl: url,
+            notes: jd,
+          })
+
+          setJobListItems((prev) =>
+            prev.map((x) => (x.id === item.id ? { ...x, status: 'done', folderName } : x)),
+          )
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Generation failed.'
+          fail(message)
+        }
+      }
+    } finally {
+      setIsBatchGenerating(false)
+      setBatchIndex(null)
+      // Restore user state
+      setDraft(draftSnapshot)
+      setCompanyName(prevCompany)
+      setJobTitle(prevTitle)
+      setJobUrl(prevUrl)
+      setNotes(prevNotes)
     }
   }
 
@@ -2790,27 +3454,20 @@ If you understand, return the single JSON object now.`,
     return next
   }
 
-  const handleDownloadResume = async () => {
-    // Require user to choose a download folder explicitly
-    if (!downloadHandle) {
-      toast.error('Please choose the folder which saves resume and cover letter')
-      return
-    }
-
-    const hasPermission = await ensureDirectoryReadWritePermission(downloadHandle)
-    if (!hasPermission) {
-      toast.error('Please allow write access to the selected folder, or choose the folder again.')
-      return
-    }
+  const writeBundleToFolder = async (
+    baseDir: FileSystemDirectoryHandle,
+    job: { draft: ResumeDraft; companyName: string; jobTitle: string; notes: string; jobUrl: string },
+  ) => {
+    const { draft: draftToSave, companyName: companyNameToSave, jobTitle: jobTitleToSave, notes: notesToSave, jobUrl: jobUrlToSave } = job
 
     const fullName = buildCandidateFullName(profile)
-    const titleLine = (draft.targetTitle || jobTitle || '').trim()
+    const titleLine = (draftToSave.targetTitle || jobTitleToSave || '').trim()
     const locationLine = profile?.location ?? ''
     const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
     // Skills are a flat list (no categories).
-    const displaySkills = normalizeSkillsForDisplay(draft.skills)
+    const displaySkills = normalizeSkillsForDisplay(draftToSave.skills)
     // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
     const keywordList = buildImportantHighlightKeywords(displaySkills)
     const preset = getResumeStylePreset(resumeStyle)
@@ -2822,10 +3479,11 @@ If you understand, return the single JSON object now.`,
     const fontFamily = preset.fontFamily
     const headingText = (value: string) => (preset.headingUppercase ? value.toUpperCase() : value)
     const headerAlignment = preset.headerAlign === 'center' ? AlignmentType.CENTER : AlignmentType.LEFT
-    const headerNameColor = resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
+    const headerNameColor =
+      resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
     const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
     const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
-      const buildHighlightedRuns = (text: string, size = 21) => {
+    const buildHighlightedRuns = (text: string, size = 21) => {
       if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       if (keywordList.length === 0) {
         return [new TextRun({ text, size, color: '111111', font: fontFamily })]
@@ -2849,8 +3507,8 @@ If you understand, return the single JSON object now.`,
       {
         boldLeft = false,
         leftColor = '111111',
-  leftSize = 21,
-  rightSize = 19,
+        leftSize = 21,
+        rightSize = 19,
       }: {
         boldLeft?: boolean
         leftColor?: string
@@ -2979,37 +3637,36 @@ If you understand, return the single JSON object now.`,
         children: [new TextRun({ text, size: 19, color: '555555', font: fontFamily })],
         spacing: { after: 60 },
       })
-    
+
     const docxSectionLabels: Record<
       ResumeLanguage,
       { summary: string; skills: string; experience: string; education: string; achievements: string; projects: string }
-    > =
-      {
-        English: {
-          summary: 'SUMMARY',
-          skills: 'SKILLS',
-          experience: 'EXPERIENCE',
-          education: 'EDUCATION',
-          achievements: 'KEY ACHIEVEMENTS',
-          projects: 'PROJECTS',
-        },
-        Japanese: {
-          summary: '概要',
-          skills: '技術スキル',
-          experience: '職務経歴',
-          education: '学歴',
-          achievements: '主な実績',
-          projects: 'プロジェクト',
-        },
-        Chinese: {
-          summary: '概要',
-          skills: '技术技能',
-          experience: '工作经历',
-          education: '教育背景',
-          achievements: '关键成果',
-          projects: '项目',
-        },
-      }
+    > = {
+      English: {
+        summary: 'SUMMARY',
+        skills: 'SKILLS',
+        experience: 'EXPERIENCE',
+        education: 'EDUCATION',
+        achievements: 'KEY ACHIEVEMENTS',
+        projects: 'PROJECTS',
+      },
+      Japanese: {
+        summary: '概要',
+        skills: '技術スキル',
+        experience: '職務経歴',
+        education: '学歴',
+        achievements: '主な実績',
+        projects: 'プロジェクト',
+      },
+      Chinese: {
+        summary: '概要',
+        skills: '技术技能',
+        experience: '工作经历',
+        education: '教育背景',
+        achievements: '关键成果',
+        projects: '项目',
+      },
+    }
 
     const doc = new Document({
       styles: {
@@ -3094,9 +3751,9 @@ If you understand, return the single JSON object now.`,
               ? []
               : [
                   new Paragraph({
-                      // Word may skip rendering borders on an empty paragraph.
-                      // Keep a single whitespace run so the separator line always appears.
-                      children: [new TextRun({ text: ' ', font: fontFamily, size: 2, color: 'FFFFFF' })],
+                    // Word may skip rendering borders on an empty paragraph.
+                    // Keep a single whitespace run so the separator line always appears.
+                    children: [new TextRun({ text: ' ', font: fontFamily, size: 2, color: 'FFFFFF' })],
                     border: {
                       bottom: {
                         color: preset.accentHex.toUpperCase(),
@@ -3110,7 +3767,7 @@ If you understand, return the single JSON object now.`,
                 ]),
             sectionHeading(docxSectionLabels[resumeLanguage].summary),
             new Paragraph({
-              children: buildHighlightedRuns(draft.summary, 21),
+              children: buildHighlightedRuns(draftToSave.summary, 21),
               alignment: AlignmentType.JUSTIFIED,
               spacing: { after: 140 },
             }),
@@ -3125,12 +3782,10 @@ If you understand, return the single JSON object now.`,
             }),
             new Paragraph({ text: '', spacing: { after: 80 } }),
             sectionHeading(docxSectionLabels[resumeLanguage].experience),
-            ...draft.workHistory.flatMap((item) => [
+            ...draftToSave.workHistory.flatMap((item) => [
               experienceLine(
                 item.resume_title || 'Role',
-                `${monthToLabel(item.start)} - ${
-                  item.end === 'Present' ? 'Present' : monthToLabel(item.end)
-                }`,
+                `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`,
                 { boldLeft: true, leftSize: 21, rightSize: 19 },
               ),
               experienceLine(
@@ -3142,7 +3797,7 @@ If you understand, return the single JSON object now.`,
               new Paragraph({ text: '' }),
             ]),
             sectionHeading(docxSectionLabels[resumeLanguage].education),
-            ...draft.education.flatMap((edu) => {
+            ...draftToSave.education.flatMap((edu) => {
               const degreeLine = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
               const metaLine = [
                 [edu.school, edu.location].filter(Boolean).join(' | '),
@@ -3167,11 +3822,11 @@ If you understand, return the single JSON object now.`,
                 educationMeta(metaLine),
               ]
             }),
-            ...(draft.keyAchievements ?? []).map((value) => value.trim()).filter(Boolean).length > 0
+            ...(draftToSave.keyAchievements ?? []).map((value) => value.trim()).filter(Boolean).length > 0
               ? [
                   new Paragraph({ text: '', spacing: { after: 80 } }),
                   sectionHeading(docxSectionLabels[resumeLanguage].achievements),
-                  ...(draft.keyAchievements ?? [])
+                  ...(draftToSave.keyAchievements ?? [])
                     .map((value) => value.trim())
                     .filter(Boolean)
                     .map((bullet) =>
@@ -3184,11 +3839,11 @@ If you understand, return the single JSON object now.`,
                     ),
                 ]
               : [],
-            ...(draft.projects ?? []).map((value) => value.trim()).filter(Boolean).length > 0
+            ...(draftToSave.projects ?? []).map((value) => value.trim()).filter(Boolean).length > 0
               ? [
                   new Paragraph({ text: '', spacing: { after: 80 } }),
                   sectionHeading(docxSectionLabels[resumeLanguage].projects),
-                  ...(draft.projects ?? [])
+                  ...(draftToSave.projects ?? [])
                     .map((value) => value.trim())
                     .filter(Boolean)
                     .map((bullet) =>
@@ -3209,73 +3864,91 @@ If you understand, return the single JSON object now.`,
     const blob = await Packer.toBlob(doc)
     const resumePdfBlob = buildResumePdfBlobDocxStyle({
       profile,
-      draft,
-      companyName: companyName || '',
-      jobTitle: (draft.targetTitle || jobTitle || '').trim(),
+      draft: draftToSave,
+      companyName: companyNameToSave || '',
+      jobTitle: (draftToSave.targetTitle || jobTitleToSave || '').trim(),
       language: resumeLanguage,
       style: resumeStyle,
     })
     const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
-    const roleSlug = sanitizeFilePart((draft.targetTitle || jobTitle || '').trim(), 'role')
-    const companySlug = sanitizeFilePart(companyName || '', 'company')
+    const roleSlug = sanitizeFilePart((draftToSave.targetTitle || jobTitleToSave || '').trim(), 'role')
+    const companySlug = sanitizeFilePart(companyNameToSave || '', 'company')
     const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
-    const coverText = draft.coverLetter || ''
-    const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft, language: resumeLanguage })
+    const coverText = draftToSave.coverLetter || ''
+    const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft: draftToSave, language: resumeLanguage })
 
     const resumeBaseName = sanitizeFileName(
-      `${buildCandidateFullName(profile) || 'Candidate'} - ${(draft.targetTitle || jobTitle || 'Role').trim()}`,
+      `${buildCandidateFullName(profile) || 'Candidate'} - ${(draftToSave.targetTitle || jobTitleToSave || 'Role').trim()}`,
       'Resume',
     )
     const resumeDocxName = `${resumeBaseName}.docx`
     const resumePdfName = `${resumeBaseName}.pdf`
 
-    const jobDescriptionText = (notes ?? '').trim()
-    const jobUrlText = (jobUrl ?? '').trim()
+    const jobDescriptionText = (notesToSave ?? '').trim()
+    const jobUrlText = (jobUrlToSave ?? '').trim()
     const jobDescriptionFileName = sanitizeFileName(
-      `${(companyName || 'Company').trim()} - ${(jobTitle || draft.targetTitle || 'Role').trim()}`,
+      `${(companyNameToSave || 'Company').trim()} - ${(jobTitleToSave || draftToSave.targetTitle || 'Role').trim()}`,
       'Job Description',
     )
     const jobDescriptionTxtName = `${jobDescriptionFileName}.txt`
-    const jobDescriptionTxtContent = jobUrlText
-      ? `${jobUrlText}\n\n${jobDescriptionText}`
-      : jobDescriptionText
+    const jobDescriptionTxtContent = jobUrlText ? `${jobUrlText}\n\n${jobDescriptionText}` : jobDescriptionText
 
-    const writeAllFilesToFolder = async (baseDir: FileSystemDirectoryHandle) => {
-      const folderHandle = await baseDir.getDirectoryHandle(folderName, { create: true })
-      const folderHasPermission = await ensureDirectoryReadWritePermission(folderHandle)
-      if (!folderHasPermission) {
-        throw new Error('Permission denied')
-      }
+    const folderHandle = await baseDir.getDirectoryHandle(folderName, { create: true })
+    const folderHasPermission = await ensureDirectoryReadWritePermission(folderHandle)
+    if (!folderHasPermission) {
+      throw new Error('Permission denied')
+    }
 
-      const resumeHandle = await folderHandle.getFileHandle(resumeDocxName, { create: true })
-      const resumeWritable = await resumeHandle.createWritable()
-      await resumeWritable.write(blob)
-      await resumeWritable.close()
+    const resumeHandle = await folderHandle.getFileHandle(resumeDocxName, { create: true })
+    const resumeWritable = await resumeHandle.createWritable()
+    await resumeWritable.write(blob)
+    await resumeWritable.close()
 
-      const resumePdfHandle = await folderHandle.getFileHandle(resumePdfName, { create: true })
-      const resumePdfWritable = await resumePdfHandle.createWritable()
-      await resumePdfWritable.write(resumePdfBlob)
-      await resumePdfWritable.close()
+    const resumePdfHandle = await folderHandle.getFileHandle(resumePdfName, { create: true })
+    const resumePdfWritable = await resumePdfHandle.createWritable()
+    await resumePdfWritable.write(resumePdfBlob)
+    await resumePdfWritable.close()
 
-      const coverHandle = await folderHandle.getFileHandle('coverletter.txt', { create: true })
-      const coverWritable = await coverHandle.createWritable()
-      await coverWritable.write(new Blob([coverText], { type: 'text/plain;charset=utf-8' }))
-      await coverWritable.close()
+    const coverHandle = await folderHandle.getFileHandle('coverletter.txt', { create: true })
+    const coverWritable = await coverHandle.createWritable()
+    await coverWritable.write(new Blob([coverText], { type: 'text/plain;charset=utf-8' }))
+    await coverWritable.close()
 
-      const coverPdfHandle = await folderHandle.getFileHandle('coverletter.pdf', { create: true })
-      const coverPdfWritable = await coverPdfHandle.createWritable()
-      await coverPdfWritable.write(coverPdfBlob)
-      await coverPdfWritable.close()
+    const coverPdfHandle = await folderHandle.getFileHandle('coverletter.pdf', { create: true })
+    const coverPdfWritable = await coverPdfHandle.createWritable()
+    await coverPdfWritable.write(coverPdfBlob)
+    await coverPdfWritable.close()
 
-      // Job description TXT (company - job title)
-      const jdHandle = await folderHandle.getFileHandle(jobDescriptionTxtName, { create: true })
-      const jdWritable = await jdHandle.createWritable()
-      await jdWritable.write(new Blob([jobDescriptionTxtContent], { type: 'text/plain;charset=utf-8' }))
-      await jdWritable.close()
+    // Job description TXT (company - job title)
+    const jdHandle = await folderHandle.getFileHandle(jobDescriptionTxtName, { create: true })
+    const jdWritable = await jdHandle.createWritable()
+    await jdWritable.write(new Blob([jobDescriptionTxtContent], { type: 'text/plain;charset=utf-8' }))
+    await jdWritable.close()
+
+    return { folderName }
+  }
+
+  const handleDownloadResume = async () => {
+    // Require user to choose a download folder explicitly
+    if (!downloadHandle) {
+      toast.error('Please choose the folder which saves resume and cover letter')
+      return
+    }
+
+    const hasPermission = await ensureDirectoryReadWritePermission(downloadHandle)
+    if (!hasPermission) {
+      toast.error('Please allow write access to the selected folder, or choose the folder again.')
+      return
     }
 
     try {
-      await writeAllFilesToFolder(downloadHandle)
+      const { folderName } = await writeBundleToFolder(downloadHandle, {
+        draft,
+        companyName,
+        jobTitle,
+        jobUrl,
+        notes,
+      })
       toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
       return
     } catch (err) {
@@ -3305,7 +3978,13 @@ If you understand, return the single JSON object now.`,
         const name = (dir as unknown as { name?: string }).name ?? null
         setDownloadHandleName(name)
 
-        await writeAllFilesToFolder(dir)
+        const { folderName } = await writeBundleToFolder(dir, {
+          draft,
+          companyName,
+          jobTitle,
+          jobUrl,
+          notes,
+        })
         toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
       } catch (retryErr) {
         console.error(retryErr)
@@ -3531,6 +4210,118 @@ If you understand, return the single JSON object now.`,
           </div>
 
           {qaError && <p className="mt-3 text-xs text-rose-400">{qaError}</p>}
+
+          <div className="mt-4 rounded-2xl border border-white/10 bg-slate-900/40 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-white">Batch generate (Excel/CSV)</p>
+                <p className="mt-0.5 text-xs text-slate-400">
+                  Upload a <span className="text-slate-200">.xlsx</span> or <span className="text-slate-200">.csv</span> with
+                  columns: <span className="text-slate-200">company_name</span>, <span className="text-slate-200">job_title</span>,{' '}
+                  <span className="text-slate-200">job_url</span>, <span className="text-slate-200">job_description</span>.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200">
+                  <input
+                    type="file"
+                    accept=".csv,.xlsx,.xls"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] ?? null
+                      void handleJobListFileSelected(file)
+                      // allow selecting same file again
+                      e.currentTarget.value = ''
+                    }}
+                  />
+                  <FiFileText /> Upload job list
+                </label>
+                <button
+                  type="button"
+                  onClick={handleBatchGenerateAndDownload}
+                  disabled={isBatchGenerating || jobListItems.length === 0}
+                  className="inline-flex items-center gap-2 rounded-full bg-indigo-500/80 px-4 py-2 text-xs font-semibold text-white transition hover:-translate-y-0.5 hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isBatchGenerating ? (
+                    <>
+                      <LoadingSpinner label="Batch generating" />
+                      Running…
+                    </>
+                  ) : (
+                    <>
+                      <FiZap /> Generate all & download
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleBatchStop}
+                  disabled={!isBatchGenerating}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:border-rose-400 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <FiRefreshCw /> Stop
+                </button>
+                <button
+                  type="button"
+                  onClick={exportJobListResultsXlsx}
+                  disabled={jobListItems.length === 0}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 px-4 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <FiDownload /> Export results (.xlsx)
+                </button>
+              </div>
+            </div>
+
+            {jobListError && <p className="mt-3 text-xs text-rose-400">{jobListError}</p>}
+
+            {(jobListItems.length > 0 || isBatchGenerating) && (
+              <div className="mt-3 rounded-xl border border-white/10 bg-slate-950/30 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-slate-200">
+                    Jobs loaded: <span className="text-white">{jobListItems.length}</span>
+                  </p>
+                  {isBatchGenerating && batchIndex !== null && (
+                    <p className="text-xs text-slate-300">
+                      Processing <span className="text-white">{batchIndex + 1}</span> / {jobListItems.length}
+                    </p>
+                  )}
+                </div>
+                <div className="mt-2 max-h-48 overflow-auto pr-1 text-xs hide-scrollbar">
+                  <div className="space-y-1">
+                    {jobListItems.map((it, idx) => (
+                      <div
+                        key={it.id}
+                        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/5 bg-slate-950/30 px-3 py-2"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-slate-100">
+                            <span className="text-slate-400">{idx + 1}.</span> {it.jobTitle || 'Role'}
+                            {it.companyName ? <span className="text-slate-400"> · {it.companyName}</span> : null}
+                          </p>
+                          {it.message && <p className="mt-0.5 truncate text-rose-300">{it.message}</p>}
+                          {it.folderName && <p className="mt-0.5 truncate text-emerald-300">Saved: {it.folderName}</p>}
+                        </div>
+                        <span
+                          className={[
+                            'rounded-full border px-2 py-1 text-[11px] font-semibold',
+                            it.status === 'done'
+                              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                              : it.status === 'failed'
+                                ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
+                                : it.status === 'running'
+                                  ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-200'
+                                  : 'border-white/10 bg-white/5 text-slate-200',
+                          ].join(' ')}
+                        >
+                          {it.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="mt-3 flex items-center gap-3">
             <button
