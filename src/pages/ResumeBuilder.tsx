@@ -174,6 +174,13 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
   },
 }
 
+const getResumeContactEmail = (profile: ReturnType<typeof useAuth>['profile']) => {
+  const v = (profile?.resume_email ?? '').toString().trim()
+  if (v) return v
+  // Backwards-compatible fallback: if resume email isn't set yet, use account email.
+  return (profile?.email ?? '').toString().trim()
+}
+
 const getResumeStylePreset = (style: ResumeStyle): ResumeStylePreset =>
   RESUME_STYLE_PRESETS[style] ?? RESUME_STYLE_PRESETS.Classic
 
@@ -817,7 +824,7 @@ const buildResumePdfBlobRasterized = (args: {
   const fullName = buildCandidateFullName(profile) || 'Candidate'
   const titleLine = jobTitle.trim()
   const locationLine = profile?.location?.trim() || ''
-  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
+  const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
 
@@ -1117,7 +1124,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   const fullName = buildCandidateFullName(profile) || 'Candidate'
   const titleLine = jobTitle.trim()
   const locationLine = profile?.location?.trim() || ''
-  const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
+  const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
 
@@ -2344,7 +2351,15 @@ A: <answer>
     const toItem = (row: Record<string, any>, idx: number): JobListItem => {
       const company = pick(row, ['company_name', 'company', 'employer'])
       const title = pick(row, ['job_title', 'title', 'role', 'position'])
-      const url = pick(row, ['job_url', 'url', 'link'])
+      const url = pick(row, [
+        'application_link',
+        'application_url',
+        'applicationlink',
+        'job_url',
+        'joburl',
+        'url',
+        'link',
+      ])
       const jd = pick(row, ['job_description', 'description', 'jd', 'notes'])
       const id = (globalThis.crypto as unknown as { randomUUID?: () => string })?.randomUUID?.() ?? `job_${Date.now()}_${idx}`
       return {
@@ -3215,7 +3230,9 @@ If you understand, return the single JSON object now.`,
     try {
       const items = await parseJobListFile(file)
       if (!items || items.length === 0) {
-        setJobListError('No rows found. Expected columns: company_name, job_title, job_url, job_description.')
+        setJobListError(
+          'No rows found. Expected columns: Job Title, Company Name, Application Link, Job Description.',
+        )
         setJobListItems([])
         setJobListSourceName(file.name ?? null)
         return
@@ -3339,7 +3356,7 @@ If you understand, return the single JSON object now.`,
         }
 
         if (!company || !title || !url) {
-          fail('Missing required fields (company_name, job_title, job_url).')
+          fail('Missing required fields (Company Name, Job Title, Application Link).')
           continue
         }
         if (jd.length < 100) {
@@ -3463,7 +3480,7 @@ If you understand, return the single JSON object now.`,
     const fullName = buildCandidateFullName(profile)
     const titleLine = (draftToSave.targetTitle || jobTitleToSave || '').trim()
     const locationLine = profile?.location ?? ''
-    const contactLine = [profile?.phone_number, profile?.email, profile?.linkedin_url, profile?.github_url]
+    const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
     // Skills are a flat list (no categories).
@@ -4217,8 +4234,8 @@ If you understand, return the single JSON object now.`,
                 <p className="text-sm font-semibold text-white">Batch generate (Excel/CSV)</p>
                 <p className="mt-0.5 text-xs text-slate-400">
                   Upload a <span className="text-slate-200">.xlsx</span> or <span className="text-slate-200">.csv</span> with
-                  columns: <span className="text-slate-200">company_name</span>, <span className="text-slate-200">job_title</span>,{' '}
-                  <span className="text-slate-200">job_url</span>, <span className="text-slate-200">job_description</span>.
+                  columns: <span className="text-slate-200">Job Title</span>, <span className="text-slate-200">Company Name</span>,{' '}
+                  <span className="text-slate-200">Application Link</span>, <span className="text-slate-200">Job Description</span>.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">

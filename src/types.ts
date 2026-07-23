@@ -6,6 +6,8 @@ export type Profile = {
   middle_name?: string | null
   last_name: string
   email: string
+  // Email used on generated resume/cover letter outputs (separate from login/account email).
+  resume_email?: string | null
   role_title?: string | null
   location?: string | null
   linkedin_url?: string | null

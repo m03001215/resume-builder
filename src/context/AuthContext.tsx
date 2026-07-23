@@ -44,6 +44,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .insert({
           id: userId,
           email: user?.email ?? '',
+          resume_email: user?.email ?? '',
           first_name: null,
           middle_name: null,
           last_name: null,
@@ -133,6 +134,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       middle_name: payload.middleName ?? null,
       last_name: payload.lastName,
       email: payload.email,
+      resume_email: payload.email,
       role_title: payload.roleTitle,
       location: payload.location,
       linkedin_url: payload.linkedinUrl ?? null,

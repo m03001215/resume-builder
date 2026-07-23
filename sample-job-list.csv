@@ -1,5 +1,5 @@
-company_name,job_title,job_url,job_description
-Acme Inc,Senior Frontend Engineer,https://example.com/jobs/123,"We are hiring a Senior Frontend Engineer to build modern React applications.
+Job Title,Company Name,Application Link,Job Description
+Senior Frontend Engineer,Acme Inc,https://example.com/jobs/123,"We are hiring a Senior Frontend Engineer to build modern React applications.
 
 Responsibilities:
 - Build responsive UI with React, TypeScript, and Tailwind
@@ -10,7 +10,7 @@ Requirements:
 - 4+ years frontend experience
 - React + TypeScript
 - Testing experience (Jest/Playwright)"
-Globex,Backend Engineer,https://example.com/careers/backend-engineer,"Backend Engineer role working on APIs and data systems.
+Backend Engineer,Globex,https://example.com/careers/backend-engineer,"Backend Engineer role working on APIs and data systems.
 
 Responsibilities:
 - Design and build REST APIs

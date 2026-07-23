@@ -32,6 +32,7 @@ type ProfileForm = {
   last_name: string
   role_title: string
   location: string
+  resume_email: string
   linkedin_url: string
   github_url: string
   phone_number: string
@@ -54,6 +55,7 @@ const createProfileForm = (profile: Profile): ProfileForm => ({
   last_name: profile.last_name ?? '',
   role_title: profile.role_title ?? '',
   location: profile.location ?? '',
+  resume_email: profile.resume_email ?? profile.email ?? '',
   linkedin_url: profile.linkedin_url ?? '',
   github_url: profile.github_url ?? '',
   phone_number: profile.phone_number ?? '',
@@ -527,6 +529,7 @@ function ProfileFormCard({
       last_name: profileForm.last_name,
       role_title: profileForm.role_title,
       location: profileForm.location,
+      resume_email: profileForm.resume_email.trim(),
       linkedin_url: profileForm.linkedin_url || null,
       github_url: profileForm.github_url || null,
       phone_number: profileForm.phone_number || null,
@@ -633,12 +636,26 @@ function ProfileFormCard({
               />
             </label>
             <label className="text-xs font-medium text-slate-300">
-              Email <span className="text-red-400">*</span>
+              Account email (login) <span className="text-red-400">*</span>
               <input
                 value={profile.email}
                 disabled
                 className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/40 px-4 py-2.5 text-[13px] text-slate-400"
               />
+            </label>
+            <label className="text-xs font-medium text-slate-300">
+              Resume email <span className="text-red-400">*</span>
+              <input
+                name="resume_email"
+                value={profileForm.resume_email}
+                onChange={handleProfileChange}
+                placeholder="your.name+jobs@gmail.com"
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-[13px] text-slate-100 focus:border-indigo-400 focus:outline-none"
+                required
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">
+                This email is used on generated resumes/cover letters and can be different from your login email.
+              </span>
             </label>
             <label className="text-xs font-medium text-slate-300">
               LinkedIn URL <span className="text-slate-400">(optional)</span>
