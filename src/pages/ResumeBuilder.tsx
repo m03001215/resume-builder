@@ -154,7 +154,7 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
     label: 'Wide',
     description: 'Extra-wide paper to reduce wrapping (ATS-friendly).',
     headerAlign: 'left',
-    fontFamily: 'Verdana',
+    fontFamily: 'Open Sans',
     pdfFontFamily: 'helvetica',
     // Tabloid paper (11x17) so lines fit without tiny margins.
     pdfPageSizePt: [792, 1224],
@@ -170,7 +170,7 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
     headingUppercase: true,
     dividerStyle: 'thin',
     bulletChar: '•',
-    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+    pdf: { nameSize: 24, titleSize: 13.5, contactSize: 11, headingSize: 12, bodySize: 12 },
   },
 }
 
@@ -586,46 +586,67 @@ const buildImportantHighlightKeywords = (skills: string[]) => {
     'git',
   ])
 
-  const phrases = (skills ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
-  const out: string[] = []
+  const phrasesRaw = (skills ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
+
+  // Keep the highlight list intentionally small: fewer, higher-signal bolds.
+  const MAX_PHRASES = 10
+  const MAX_TOKENS = 6
+  const MAX_TOTAL = 9
+
   const seen = new Set<string>()
-
-  const push = (value: string) => {
-    const v = value.trim()
-    if (!v) return
-    const key = v.toLowerCase()
-    if (seen.has(key)) return
-    seen.add(key)
-    out.push(v)
+  const dedupe = (arr: string[]) => {
+    const out: string[] = []
+    for (const v of arr) {
+      const key = v.toLowerCase()
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      out.push(v)
+    }
+    return out
   }
 
-  // Always include full phrases (e.g., "AWS Lambda", "Real-time streaming").
-  // Also include simple hyphen/space variants so "graph based" and "graph-based" both highlight as one.
-  for (const phrase of phrases) {
-    push(phrase)
-    const withAsciiHyphen = phrase.replace(/[–—]/g, '-')
-    const spaced = withAsciiHyphen.replace(/-/g, ' ').replace(/\s+/g, ' ').trim()
-    const hyphenated = withAsciiHyphen.replace(/\s+/g, '-').trim()
-    if (spaced && spaced !== phrase) push(spaced)
-    if (hyphenated && hyphenated !== phrase) push(hyphenated)
-  }
+  // 1) Phrases first (these are usually the most meaningful).
+  const phraseCandidates = dedupe(phrasesRaw)
+  const phraseKeywords = phraseCandidates
+    .slice(0, MAX_PHRASES)
+    .flatMap((phrase) => {
+      const base = phrase.trim()
+      const withAsciiHyphen = base.replace(/[–—]/g, '-')
+      const spaced = withAsciiHyphen.replace(/-/g, ' ').replace(/\s+/g, ' ').trim()
+      // Include at most one variant to avoid growing the keyword set too much.
+      return spaced && spaced !== base ? [base, spaced] : [base]
+    })
 
-  // Add selective tokens derived from phrases (avoid short/common words).
-  for (const phrase of phrases) {
+  // 2) A small set of standalone tokens/acronyms (React, SQL, AWS, etc.)
+  const tokenCandidates: string[] = []
+  for (const phrase of phraseCandidates) {
     const tokens = phrase.match(/[A-Za-z0-9]+/g) ?? []
     for (const token of tokens) {
       const lower = token.toLowerCase()
       if (!lower || stopwords.has(lower)) continue
-
-      const isAcronym = token === token.toUpperCase() && /[A-Z]/.test(token) && token.length >= 2 && token.length <= 6
-      if (importantShort.has(lower) || isAcronym || token.length >= 4) {
-        push(token)
-      }
+      const isAcronym =
+        token === token.toUpperCase() && /[A-Z]/.test(token) && token.length >= 2 && token.length <= 6
+      if (importantShort.has(lower) || isAcronym || token.length >= 4) tokenCandidates.push(token)
     }
   }
 
+  // Sort tokens by "importance-ish" (short important acronyms first, then length).
+  const tokenKeywords = dedupe(tokenCandidates)
+    .sort((a, b) => {
+      const aLower = a.toLowerCase()
+      const bLower = b.toLowerCase()
+      const aBoost = importantShort.has(aLower) ? 2 : a === a.toUpperCase() ? 1 : 0
+      const bBoost = importantShort.has(bLower) ? 2 : b === b.toUpperCase() ? 1 : 0
+      if (aBoost !== bBoost) return bBoost - aBoost
+      return b.length - a.length
+    })
+    .slice(0, MAX_TOKENS)
+
   // Sort longest-first so phrases match before sub-tokens.
-  return out.sort((a, b) => b.length - a.length)
+  const combined = [...phraseKeywords, ...tokenKeywords]
+  return combined
+    .sort((a, b) => b.length - a.length)
+    .slice(0, MAX_TOTAL)
 }
 
 const normalizeHighlightKey = (value: string) =>
@@ -668,7 +689,7 @@ const mergeHyphenatedHighlights = <T extends { text: string; bold: boolean }>(to
 
 const limitRepeatedHighlights = <T extends { text: string; bold: boolean }>(tokens: T[]): T[] => {
   // Reduce noisy repetitive bolding within the same paragraph.
-  const maxTotalBold = 14
+  const maxTotalBold = 9
   const counts = new Map<string, number>()
   let totalBold = 0
 
@@ -687,6 +708,15 @@ const limitRepeatedHighlights = <T extends { text: string; bold: boolean }>(toke
     totalBold += 1
     return token
   })
+}
+
+const hasMeasurableImpact = (text: unknown) => {
+  const s = (text ?? '').toString()
+  if (!s.trim()) return false
+  // Require a number with a unit/symbol to avoid counting years like "2023".
+  return /(\$[\d,.]+|\b\d[\d,.]*\s?(%|ms|s|sec|secs|seconds|min|mins|minutes|hr|hrs|hours|day|days|week|weeks|month|months|year|years|x)\b|\b\d[\d,.]*x\b|\bp(50|95|99)\b)/i.test(
+    s,
+  )
 }
 
 const SECTION_LABELS: Record<
@@ -1177,6 +1207,9 @@ const buildResumePdfBlobDocxStyle = (args: {
   // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
   const keywordList = buildImportantHighlightKeywords(displaySkills)
   const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
+  const globalBoldSeen = new Set<string>()
+  let globalBoldCount = 0
+  const GLOBAL_BOLD_MAX = 9
 
   type Token = { text: string; bold: boolean }
 
@@ -1193,7 +1226,16 @@ const buildResumePdfBlobDocxStyle = (args: {
       .split(pattern)
       .filter((chunk) => chunk.length > 0)
       .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
-    return limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
+    const merged = limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
+    // Bold each keyword at most once across the whole resume.
+    return merged.map((t) => {
+      if (!t.bold) return t
+      const key = normalizeHighlightKey(t.text)
+      if (!key || globalBoldSeen.has(key) || globalBoldCount >= GLOBAL_BOLD_MAX) return { ...t, bold: false }
+      globalBoldSeen.add(key)
+      globalBoldCount += 1
+      return t
+    })
   }
 
   const expandWhitespace = (tokens: Token[]) => {
@@ -2606,7 +2648,8 @@ INSTRUCTIONS:
    - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
    - Every returned workHistory entry MUST include a non-empty resumeTitle string.
 0.4 Key Achievements + Projects (required):
-   - keyAchievements MUST be a non-empty array with 4–6 items.
+   - keyAchievements MUST be a non-empty array with 5–6 items.
+   - Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like "[X%]" when necessary and record them in 'notes'.
    - projects MUST be an array with EXACTLY 3 items.
    - Each project must be extremely relevant to the job description.
    - Each project item must be ONE sentence and must include ALL of:
@@ -2644,7 +2687,7 @@ INSTRUCTIONS:
 24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
 25. The bullets should be outcome-driven and should include real metrics results as much as possible.
 27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
-28. Include 12–20 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
+28. Include 18–28 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
 29. All job-description technologies must appear in both Skills and Experience sections.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
@@ -2658,6 +2701,10 @@ Additional rules (apply exactly):
 
 - Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
   - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
+
+- Measurable impact (required):
+  - Include at least 5 measurable, specific impact statements across the resume output (keyAchievements and/or workHistory bullets).
+  - Do not fabricate numbers; use placeholders like "[X%]" only when necessary and note them in 'notes'.
 
 - Bullets (strict):
   - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
@@ -2718,6 +2765,71 @@ If you understand, return the single JSON object now.`,
           .replace(/```\s*$/i, '')
           .trim()
         return JSON.parse(cleaned)
+      }
+
+      const ensureSkills = async (draftParsed: any) => {
+        const existing = Array.isArray(draftParsed?.claimedSkills)
+          ? draftParsed.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : Array.isArray(draftParsed?.skills)
+            ? draftParsed.skills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+            : []
+
+        const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
+        if (unique.length >= 18) return draftParsed
+
+        const repairPayload = {
+          resumeLanguage,
+          targetJobTitle: jobTitle,
+          jobDescription: notes,
+          existingSkills: unique,
+          // provide evidence sources: profile skills + generated workHistory bullets (post-generation will include JD tech)
+          payloadSkills: payload.skills ?? [],
+          workHistory: payload.workHistory ?? [],
+        }
+
+        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            messages: [
+              {
+                role: 'system',
+                content: 'Output ONLY valid JSON (no markdown). Return: { claimedSkills: string[] } and nothing else.',
+              },
+              {
+                role: 'user',
+                content: `Expand the resume claimedSkills list to 18–28 items, prioritizing job-description relevance.
+
+Rules:
+- Output claimedSkills as a flat string array.
+- Include all P1/P2 job-description technologies.
+- Do not invent certifications or tools with no plausible evidence; if adding a JD tool not present in payloadSkills, it must be consistent with the work history context.
+- Keep items concise (1–3 words each where possible), deduplicate, and avoid near-duplicates.
+
+Payload:
+${JSON.stringify(repairPayload)}`,
+              },
+            ],
+          }),
+        })
+
+        const repairData = await repairResponse.json().catch(() => null)
+        if (!repairResponse.ok) return draftParsed
+
+        const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+        const repaired = parseModelJson(repairContent)
+        const next = Array.isArray(repaired?.claimedSkills)
+          ? repaired.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+        if (next.length >= 18) {
+          draftParsed.claimedSkills = next.slice(0, 28)
+        }
+        return draftParsed
       }
 
       const ensureResumeTitles = async (draftParsed: any) => {
@@ -2805,7 +2917,8 @@ If you understand, return the single JSON object now.`,
           ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
           : []
 
-        const needsAchievements = existingAchievements.length === 0
+        const measurableAchievements = existingAchievements.filter((a: string) => hasMeasurableImpact(a))
+        const needsAchievements = existingAchievements.length < 5 || measurableAchievements.length < 5
         const needsProjects = existingProjects.length === 0
         if (!needsAchievements && !needsProjects) return draftParsed
 
@@ -2841,7 +2954,7 @@ If you understand, return the single JSON object now.`,
               },
               {
                 role: 'user',
-                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like \"[X%]\" when necessary and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                   repairPayload,
                 )}`,
               },
@@ -2867,7 +2980,7 @@ If you understand, return the single JSON object now.`,
         return draftParsed
       }
 
-      const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(parsed))
+      const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed)))
 
       updateDraft((prev) => applyParsedToDraft(prev, { parsed, parsedWithTitles, jobTitleFallback: jobTitle }))
       setHasGenerated(true)
@@ -3001,7 +3114,7 @@ INSTRUCTIONS:
 24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
 25. The bullets should be outcome-driven and should include real metrics results as much as possible.
 27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
-28. Include 12–20 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
+28. Include 18–28 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
 29. All job-description technologies must appear in both Skills and Experience sections.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
@@ -3075,6 +3188,70 @@ If you understand, return the single JSON object now.`,
         .replace(/```\s*$/i, '')
         .trim()
       return JSON.parse(cleaned)
+    }
+
+    const ensureSkills = async (draftParsed: any) => {
+      const existing = Array.isArray(draftParsed?.claimedSkills)
+        ? draftParsed.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+        : Array.isArray(draftParsed?.skills)
+          ? draftParsed.skills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+          : []
+
+      const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
+      if (unique.length >= 18) return draftParsed
+
+      const repairPayload = {
+        resumeLanguage,
+        targetJobTitle: jobTitleInput,
+        jobDescription: notesInput,
+        existingSkills: unique,
+        payloadSkills: payload.skills ?? [],
+        workHistory: payload.workHistory ?? [],
+      }
+
+      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            {
+              role: 'system',
+              content: 'Output ONLY valid JSON (no markdown). Return: { claimedSkills: string[] } and nothing else.',
+            },
+            {
+              role: 'user',
+              content: `Expand the resume claimedSkills list to 18–28 items, prioritizing job-description relevance.
+
+Rules:
+- Output claimedSkills as a flat string array.
+- Include all P1/P2 job-description technologies.
+- Do not invent certifications or tools with no plausible evidence; if adding a JD tool not present in payloadSkills, it must be consistent with the work history context.
+- Keep items concise (1–3 words each where possible), deduplicate, and avoid near-duplicates.
+
+Payload:
+${JSON.stringify(repairPayload)}`,
+            },
+          ],
+        }),
+      })
+
+      const repairData = await repairResponse.json().catch(() => null)
+      if (!repairResponse.ok) return draftParsed
+
+      const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
+      const repaired = parseModelJson(repairContent)
+      const next = Array.isArray(repaired?.claimedSkills)
+        ? repaired.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
+        : []
+      if (next.length >= 18) {
+        draftParsed.claimedSkills = next.slice(0, 28)
+      }
+      return draftParsed
     }
 
     const ensureResumeTitles = async (draftParsed: any) => {
@@ -3159,7 +3336,8 @@ If you understand, return the single JSON object now.`,
         ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
         : []
 
-      const needsAchievements = existingAchievements.length === 0
+      const measurableAchievements = existingAchievements.filter((a: string) => hasMeasurableImpact(a))
+      const needsAchievements = existingAchievements.length < 5 || measurableAchievements.length < 5
       const needsProjects = existingProjects.length === 0
       if (!needsAchievements && !needsProjects) return draftParsed
 
@@ -3194,7 +3372,7 @@ If you understand, return the single JSON object now.`,
             },
             {
               role: 'user',
-              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 4–6 items.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like \"[X%]\" when necessary and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                 repairPayload,
               )}`,
             },
@@ -3220,7 +3398,7 @@ If you understand, return the single JSON object now.`,
       return draftParsed
     }
 
-    const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(parsed))
+    const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed)))
     return applyParsedToDraft(base, { parsed, parsedWithTitles, jobTitleFallback: jobTitleInput })
   }
 
@@ -3500,6 +3678,9 @@ If you understand, return the single JSON object now.`,
       resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
     const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
     const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
+    const globalBoldSeen = new Set<string>()
+    let globalBoldCount = 0
+    const GLOBAL_BOLD_MAX = 9
     const buildHighlightedRuns = (text: string, size = 21) => {
       if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
       if (keywordList.length === 0) {
@@ -3516,7 +3697,15 @@ If you understand, return the single JSON object now.`,
         .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
 
       const merged = limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
-      return merged.map((t) => new TextRun({ text: t.text, bold: t.bold, size, color: '111111', font: fontFamily }))
+      const once = merged.map((t) => {
+        if (!t.bold) return t
+        const key = normalizeHighlightKey(t.text)
+        if (!key || globalBoldSeen.has(key) || globalBoldCount >= GLOBAL_BOLD_MAX) return { ...t, bold: false }
+        globalBoldSeen.add(key)
+        globalBoldCount += 1
+        return t
+      })
+      return once.map((t) => new TextRun({ text: t.text, bold: t.bold, size, color: '111111', font: fontFamily }))
     }
     const experienceLine = (
       left: string,
