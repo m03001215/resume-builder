@@ -152,25 +152,24 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
   },
   Wide: {
     label: 'Wide',
-    description: 'Extra-wide paper to reduce wrapping (ATS-friendly).',
+    description: 'More horizontal space + larger fonts (ATS-friendly).',
     headerAlign: 'left',
     fontFamily: 'Open Sans',
     pdfFontFamily: 'helvetica',
-    // Tabloid paper (11x17) so lines fit without tiny margins.
-    pdfPageSizePt: [792, 1224],
-    docxPageSizeTwips: { width: 15840, height: 24480 },
+    // Use standard Letter sizing so the PDF doesn't open "tiny" by default in viewers.
+    // (Many viewers auto-fit large pages like Tabloid, making text appear small.)
     // Comfortable margins (more space before name, larger left/right margins).
     // Smaller left/right, more top/bottom padding.
-    pdfMarginPtX: 36,
-    pdfMarginPtY: 72,
-    docxMarginTwipsX: 720,
-    docxMarginTwipsY: 1440,
+    pdfMarginPtX: 42,
+    pdfMarginPtY: 54,
+    docxMarginTwipsX: 840,
+    docxMarginTwipsY: 1080,
     accentHex: '0ea5e9',
     headingStyle: 'underline',
     headingUppercase: true,
     dividerStyle: 'thin',
     bulletChar: '•',
-    pdf: { nameSize: 24, titleSize: 13.5, contactSize: 11, headingSize: 12, bodySize: 12 },
+    pdf: { nameSize: 22, titleSize: 12.5, contactSize: 10.5, headingSize: 11.5, bodySize: 11.5 },
   },
 }
 
@@ -179,6 +178,92 @@ const getResumeContactEmail = (profile: ReturnType<typeof useAuth>['profile']) =
   if (v) return v
   // Backwards-compatible fallback: if resume email isn't set yet, use account email.
   return (profile?.email ?? '').toString().trim()
+}
+
+const generalizeJobTitle = (rawTitle: string, jobDescription: string) => {
+  const raw = (rawTitle ?? '').toString().replace(/\s+/g, ' ').trim()
+  if (!raw) return ''
+
+  const jd = (jobDescription ?? '').toString().toLowerCase()
+  const norm = raw.replace(/[–—]/g, '-').trim()
+
+  const stripParens = (s: string) => s.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim()
+  const stripTrailingQualifiers = (s: string) => {
+    // Remove trailing qualifiers after dash if they look like org/platform/location info.
+    const parts = s.split(/\s+-\s+/).map((p) => p.trim()).filter(Boolean)
+    if (parts.length <= 1) return s.trim()
+    const right = parts.slice(1).join(' - ').toLowerCase()
+    const rightLooksQualifier = /\b(remote|hybrid|onsite|on[- ]site|work from|wfh|anywhere|timezone|martech|platform|team|org|organization|dept|department|group|pod|squad|connect|growth|payments|infra|infrastructure)\b/.test(
+      right,
+    )
+    return rightLooksQualifier ? parts[0] : s.trim()
+  }
+
+  // Start with cleaned title.
+  let base = stripTrailingQualifiers(norm)
+
+  // Drop parentheses that are clearly not part of the role.
+  const parenContent = (norm.match(/\(([^)]*)\)/) ?? [])[1]?.toLowerCase() ?? ''
+  const parenLooksQualifier = /\b(remote|hybrid|onsite|on[- ]site|work from|wfh|anywhere|timezone|platform|team|dept|department|connect|martech)\b/.test(
+    parenContent,
+  )
+  if (parenLooksQualifier) base = stripParens(base)
+
+  // If still has parentheses, keep only specialization-like ones by turning them into prefix.
+  const specialization = (norm.match(/\((backend|frontend|full\s*stack|fullstack|mobile|ios|android|devops|sre|data|ml|machine learning|security|qa|sdet)\)/i) ??
+    [])[1]
+  base = stripParens(base)
+
+  const cleaned = base.replace(/\s+/g, ' ').trim()
+  if (!cleaned) return raw
+
+  // If title is very generic, refine from JD signals.
+  const lowerTitle = cleaned.toLowerCase()
+  const isGenericSE =
+    /\bsoftware engineer\b/.test(lowerTitle) ||
+    /\bengineer\b/.test(lowerTitle) ||
+    /\bdeveloper\b/.test(lowerTitle)
+
+  const score = (patterns: RegExp[]) => patterns.reduce((acc, r) => acc + (r.test(jd) ? 1 : 0), 0)
+  const frontScore = score([/\breact\b/, /\btypescript\b/, /\bfrontend\b/, /\bcss\b/, /\bnext\.js\b/, /\btailwind\b/, /\bui\b/])
+  const backScore = score([/\bbackend\b/, /\bapi\b/, /\brest\b/, /\bgraphql\b/, /\bpostgres\b/, /\bmysql\b/, /\bredis\b/, /\bnode\.js\b/, /\bpython\b/, /\bjava\b/])
+  const dataScore = score([/\bdata engineer\b/, /\betl\b/, /\bspark\b/, /\bwarehouse\b/, /\bairflow\b/, /\bdbt\b/])
+  const devopsScore = score([/\bdevops\b/, /\bsre\b/, /\bkubernetes\b/, /\bdocker\b/, /\bterraform\b/, /\bci\/cd\b/])
+  const mlScore = score([/\bmachine learning\b/, /\bml\b/, /\bmodel\b/, /\bllm\b/, /\btraining\b/])
+
+  const preserveSeniority = () => {
+    const m = cleaned.match(/\b(intern|junior|jr\.|mid|senior|sr\.|staff|principal|lead|manager|director|vp|head)\b/i)
+    return m ? m[0].replace(/\.$/, '') : ''
+  }
+  const seniority = preserveSeniority()
+
+  const pick = (role: string) => (seniority ? `${seniority} ${role}`.replace(/\s+/g, ' ').trim() : role)
+
+  let inferred: string | null = null
+  if (isGenericSE && (frontScore || backScore || dataScore || devopsScore || mlScore)) {
+    const max = Math.max(frontScore, backScore, dataScore, devopsScore, mlScore)
+    if (max === dataScore) inferred = pick('Data Engineer')
+    else if (max === devopsScore) inferred = pick('DevOps Engineer')
+    else if (max === mlScore) inferred = pick('Machine Learning Engineer')
+    else if (max === frontScore) inferred = pick('Frontend Engineer')
+    else if (max === backScore) inferred = pick('Backend Engineer')
+  }
+
+  // Apply specialization prefix if we captured one (and didn’t infer a more specific role).
+  if (!inferred && specialization) {
+    const spec = specialization.toLowerCase()
+    if (spec.includes('backend')) inferred = pick('Backend Engineer')
+    else if (spec.includes('frontend')) inferred = pick('Frontend Engineer')
+    else if (spec.includes('full')) inferred = pick('Full Stack Engineer')
+    else if (spec.includes('devops') || spec.includes('sre')) inferred = pick('DevOps Engineer')
+    else if (spec.includes('data')) inferred = pick('Data Engineer')
+    else if (spec.includes('ml') || spec.includes('machine')) inferred = pick('Machine Learning Engineer')
+    else if (spec.includes('security')) inferred = pick('Security Engineer')
+    else if (spec.includes('qa') || spec.includes('sdet')) inferred = pick('QA Engineer')
+    else if (spec.includes('mobile') || spec.includes('ios') || spec.includes('android')) inferred = pick('Mobile Engineer')
+  }
+
+  return (inferred ?? cleaned).replace(/\s+/g, ' ').trim()
 }
 
 const getResumeStylePreset = (style: ResumeStyle): ResumeStylePreset =>
@@ -503,6 +588,18 @@ const sanitizeFileName = (value: string, fallback: string) => {
 
 const stripTrailingEstimateTag = (value: string) =>
   (value ?? '').replace(/\s*\(est\.\)\s*$/i, '').trim()
+
+const stripBracketedMetrics = (value: string) => {
+  const s = (value ?? '').toString()
+  if (!s) return s
+
+  // Replace simple bracketed metric tokens like:
+  // [30%] -> 30%, [$5k] -> $5k, [2x] -> 2x, [120ms] -> 120ms, [p95] -> p95, [X%] -> X%
+  return s.replace(
+    /\[\s*(\$?\s*(?:[Xx]|\d[\d,]*)(?:\.\d+)?\s*(?:%|x|ms|s|sec|secs|seconds|min|mins|minutes|hr|hrs|hours|day|days|week|weeks|month|months|year|years)|p(?:50|95|99))\s*\]/g,
+    (_m, inner) => (inner ?? '').toString().replace(/\s+/g, ''),
+  )
+}
 
 const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
   [profile?.first_name, profile?.middle_name, profile?.last_name]
@@ -2363,10 +2460,12 @@ A: <answer>
       skillDisplayLines,
       coverLetter: parsedWithTitles?.coverLetter ? sanitizeMultilineText(parsedWithTitles.coverLetter) : prev.coverLetter,
       keyAchievements: Array.isArray(parsedWithTitles?.keyAchievements)
-        ? parsedWithTitles.keyAchievements.map((s: string) => sanitizeText(s)).filter(Boolean)
+        ? parsedWithTitles.keyAchievements.map((s: string) => stripBracketedMetrics(sanitizeText(s))).filter(Boolean)
         : prev.keyAchievements,
       projects: Array.isArray(parsedWithTitles?.projects)
-        ? parsedWithTitles.projects.map((s: string) => stripTrailingEstimateTag(sanitizeText(s))).filter(Boolean)
+        ? parsedWithTitles.projects
+            .map((s: string) => stripTrailingEstimateTag(stripBracketedMetrics(sanitizeText(s))))
+            .filter(Boolean)
         : prev.projects,
       workHistory,
     }
@@ -2534,6 +2633,8 @@ A: <answer>
       return
     }
 
+    const generalizedJobTitle = generalizeJobTitle(jobTitle, notes)
+
     if (!jobUrl.trim()) {
       const msg = 'Please enter a Job URL before generating.'
       setError(msg)
@@ -2634,10 +2735,10 @@ A: <answer>
 INSTRUCTIONS:
 0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
    - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (role-agnostic): The resume must read like a "${jobTitle}" resume first.
+0.1 Target role focus (role-agnostic): The resume must read like a "${generalizedJobTitle}" resume first.
    - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
    - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${jobTitle}" and are supported by the payload + job description.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${generalizedJobTitle}" and are supported by the payload + job description.
    - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
    - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
 0.2 Experience titles (required):
@@ -2649,7 +2750,7 @@ INSTRUCTIONS:
    - Every returned workHistory entry MUST include a non-empty resumeTitle string.
 0.4 Key Achievements + Projects (required):
    - keyAchievements MUST be a non-empty array with 5–6 items.
-   - Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like "[X%]" when necessary and record them in 'notes'.
+   - Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary, use placeholders like "X%" (no brackets) and record them in 'notes'.
    - projects MUST be an array with EXACTLY 3 items.
    - Each project must be extremely relevant to the job description.
    - Each project item must be ONE sentence and must include ALL of:
@@ -2704,7 +2805,7 @@ Additional rules (apply exactly):
 
 - Measurable impact (required):
   - Include at least 5 measurable, specific impact statements across the resume output (keyAchievements and/or workHistory bullets).
-  - Do not fabricate numbers; use placeholders like "[X%]" only when necessary and note them in 'notes'.
+  - Do not fabricate numbers; use placeholders like "X%" only when necessary (no brackets) and note them in 'notes'.
 
 - Bullets (strict):
   - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
@@ -2954,7 +3055,7 @@ ${JSON.stringify(repairPayload)}`,
               },
               {
                 role: 'user',
-                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like \"[X%]\" when necessary and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary use placeholders like \"X%\" (no brackets) and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                   repairPayload,
                 )}`,
               },
@@ -2982,13 +3083,15 @@ ${JSON.stringify(repairPayload)}`,
 
       const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed)))
 
-      updateDraft((prev) => applyParsedToDraft(prev, { parsed, parsedWithTitles, jobTitleFallback: jobTitle }))
+      updateDraft((prev) =>
+        applyParsedToDraft(prev, { parsed, parsedWithTitles, jobTitleFallback: generalizedJobTitle }),
+      )
       setHasGenerated(true)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
-      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, jobTitle))
+      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, generalizedJobTitle))
       setHasGenerated(true)
     } finally {
       setIsGenerating(false)
@@ -3017,6 +3120,7 @@ ${JSON.stringify(repairPayload)}`,
     const careerEndYear = endYears.length > 0 ? Math.max(...endYears) : undefined
 
     const jobTitleInput = (item.jobTitle ?? '').trim()
+    const generalizedJobTitleInput = generalizeJobTitle(jobTitleInput, item.jobDescription ?? '')
     const notesInput = (item.jobDescription ?? '').trim()
 
     const payload = {
@@ -3062,10 +3166,10 @@ ${JSON.stringify(repairPayload)}`,
 INSTRUCTIONS:
 0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
    - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (role-agnostic): The resume must read like a "${jobTitleInput}" resume first.
+0.1 Target role focus (role-agnostic): The resume must read like a "${generalizedJobTitleInput}" resume first.
    - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
    - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${jobTitleInput}" and are supported by the payload + job description.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${generalizedJobTitleInput}" and are supported by the payload + job description.
    - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
    - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
 0.2 Experience titles (required):
@@ -3202,7 +3306,7 @@ If you understand, return the single JSON object now.`,
 
       const repairPayload = {
         resumeLanguage,
-        targetJobTitle: jobTitleInput,
+        targetJobTitle: generalizedJobTitleInput,
         jobDescription: notesInput,
         existingSkills: unique,
         payloadSkills: payload.skills ?? [],
@@ -3269,7 +3373,7 @@ ${JSON.stringify(repairPayload)}`,
       if (missingIds.length === 0) return draftParsed
 
       const repairPayload = {
-        targetJobTitle: jobTitleInput,
+        targetJobTitle: generalizedJobTitleInput,
         targetTitle: draftParsed?.targetTitle ?? '',
         jobDescription: notesInput,
         workHistory: payload.workHistory.map((w) => ({
@@ -3343,7 +3447,7 @@ ${JSON.stringify(repairPayload)}`,
 
       const repairPayload = {
         resumeLanguage,
-        targetJobTitle: jobTitleInput,
+        targetJobTitle: generalizedJobTitleInput,
         targetTitle: draftParsed?.targetTitle ?? '',
         jobDescription: notesInput,
         summary: draftParsed?.summary ?? payload.summary,
@@ -3372,7 +3476,7 @@ ${JSON.stringify(repairPayload)}`,
             },
             {
               role: 'user',
-              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; use placeholders like \"[X%]\" when necessary and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary use placeholders like \"X%\" (no brackets) and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                 repairPayload,
               )}`,
             },
@@ -3399,7 +3503,7 @@ ${JSON.stringify(repairPayload)}`,
     }
 
     const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed)))
-    return applyParsedToDraft(base, { parsed, parsedWithTitles, jobTitleFallback: jobTitleInput })
+    return applyParsedToDraft(base, { parsed, parsedWithTitles, jobTitleFallback: generalizedJobTitleInput })
   }
 
   const handleJobListFileSelected = async (file?: File | null) => {
@@ -3617,7 +3721,7 @@ ${JSON.stringify(repairPayload)}`,
     setIsSaving(true)
     setError(null)
     const resolvedCompanyName = companyName.trim()
-    const resolvedJobTitle = jobTitle.trim()
+    const resolvedJobTitle = generalizeJobTitle(jobTitle, notes)
     const fileNames = buildFileNames(profile, resolvedCompanyName, resolvedJobTitle)
     const { error: insertError } = await supabase.from('applied_jobs').insert({
       profile_id: profile.id,
