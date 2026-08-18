@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  FiCheckCircle,
   FiChevronDown,
   FiChevronUp,
   FiDownload,
   FiFileText,
+  FiFolder,
   FiPlus,
   FiRefreshCw,
   FiSave,
+  FiX,
   FiZap,
   FiTrash2,
 } from 'react-icons/fi'
@@ -292,13 +295,20 @@ type EducationItem = {
   location: string
 }
 
+type SkillCategory = {
+  category: string
+  skills: string[]
+}
+
 type ResumeDraft = {
   // Generated title aligned to target job role (from model output).
   targetTitle?: string
   summary: string
+  // Flat list of every skill, kept in sync with skillCategories. Used for the DB record.
   skills: string[]
-  // Optional display lines for grouped skills like "Frontend: React, Vue"
-  skillDisplayLines?: string[]
+  // Grouped skills rendered as "Frontend: React, Vue" lines. Absent for drafts generated
+  // before categorization, which fall back to a single bullet-separated line.
+  skillCategories?: SkillCategory[]
   workHistory: WorkHistoryItem[]
   education: EducationItem[]
   keyAchievements: string[]
@@ -601,6 +611,47 @@ const stripBracketedMetrics = (value: string) => {
   )
 }
 
+// Some model responses fall back to a literal "X" placeholder (e.g. "X%", "X percent", "[X%]") instead of
+// a real number when no metric is available, despite prompt instructions not to. Strip those placeholder
+// phrases (including a leading preposition like "by X%") so an unresolved "X" never reaches the resume.
+// Real numbers (e.g. "30%") are untouched since the lookbehind/lookahead require a standalone "X" token.
+// Longer unit words must precede their prefixes (e.g. "minutes?" before "mins?") so the regex
+// engine doesn't stop at the shorter alternative and leave a dangling suffix like "utes" behind.
+const PLACEHOLDER_METRIC_UNIT =
+  '%|percent(?:age)?(?:[ \\t]+points?)?|\\$|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?'
+// Note: no leading [ \t]* — only the trailing whitespace is consumed, so exactly one of the two
+// surrounding spaces survives instead of gluing the words on either side together.
+const PLACEHOLDER_METRIC_WITH_PREPOSITION = new RegExp(
+  `\\b(?:by|of|to|at|with)[ \\t]+\\[?(?<![A-Za-z0-9])X(?![A-Za-z0-9])[ \\t]*(?:${PLACEHOLDER_METRIC_UNIT})[ \\t]*\\]?`,
+  'gi',
+)
+const PLACEHOLDER_METRIC_STANDALONE = new RegExp(
+  `\\[?(?<![A-Za-z0-9])X(?![A-Za-z0-9])[ \\t]*(?:${PLACEHOLDER_METRIC_UNIT})[ \\t]*\\]?`,
+  'gi',
+)
+
+// Candidate-authored text (draft bullets, key achievements, projects) is the only source of real,
+// verifiable metrics available to the generator, so it is passed to the model as evidence.
+const collectEvidenceLines = (values?: string[]) =>
+  (values ?? []).map((value) => (value ?? '').toString().trim()).filter(Boolean)
+
+const stripPlaceholderMetrics = (value: string) => {
+  const s = (value ?? '').toString()
+  if (!s) return s
+
+  return s
+    .replace(PLACEHOLDER_METRIC_WITH_PREPOSITION, '')
+    .replace(PLACEHOLDER_METRIC_STANDALONE, '')
+    .split('\n')
+    .map((line) =>
+      line
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/[ \t]+([.,;:!?])/g, '$1')
+        .trim(),
+    )
+    .join('\n')
+}
+
 const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
   [profile?.first_name, profile?.middle_name, profile?.last_name]
     .filter((value): value is string => Boolean(value && value.trim()))
@@ -632,179 +683,83 @@ const normalizeSkillsForDisplay = (skills: string[]) => {
   return out
 }
 
-const buildImportantHighlightKeywords = (skills: string[]) => {
-  const stopwords = new Set<string>([
-    // articles / connectors
-    'a',
-    'an',
-    'the',
-    'and',
-    'or',
-    'to',
-    'of',
-    'in',
-    'on',
-    'for',
-    'with',
-    'as',
-    'at',
-    'by',
-    'from',
-    'into',
-    'via',
-    'within',
-    'across',
-    'over',
-    'under',
-    'per',
-    'vs',
-    // too-generic words that create noisy bolding
-    'data',
-    'time',
-  ])
-
-  const importantShort = new Set<string>([
-    'ai',
-    'ml',
-    'ui',
-    'ux',
-    'qa',
-    'ci',
-    'cd',
-    'aws',
-    'gcp',
-    'sql',
-    'etl',
-    'api',
-    'sdk',
-    'jwt',
-    'kpi',
-    'okr',
-    'git',
-  ])
-
-  const phrasesRaw = (skills ?? []).map((s) => (s ?? '').trim()).filter(Boolean)
-
-  // Keep the highlight list intentionally small: fewer, higher-signal bolds.
-  const MAX_PHRASES = 10
-  const MAX_TOKENS = 6
-  const MAX_TOTAL = 9
-
-  const seen = new Set<string>()
-  const dedupe = (arr: string[]) => {
-    const out: string[] = []
-    for (const v of arr) {
-      const key = v.toLowerCase()
-      if (!key || seen.has(key)) continue
-      seen.add(key)
-      out.push(v)
-    }
-    return out
+// Flattens whatever skill shape the model returned (categorized object, or a legacy flat
+// claimedSkills/skills array) into a single list, so counts and repair passes work either way.
+const flattenClaimedSkills = (parsed: unknown, sanitize: (value: unknown) => string): string[] => {
+  const source = parsed as Record<string, unknown> | null | undefined
+  const byCategory = source?.claimedSkillsByCategory
+  if (byCategory && typeof byCategory === 'object' && !Array.isArray(byCategory)) {
+    const values = Object.values(byCategory as Record<string, unknown>)
+      .flatMap((list) => (Array.isArray(list) ? list : []))
+      .map((value) => sanitize(value))
+      .filter(Boolean)
+    if (values.length > 0) return values
   }
 
-  // 1) Phrases first (these are usually the most meaningful).
-  const phraseCandidates = dedupe(phrasesRaw)
-  const phraseKeywords = phraseCandidates
-    .slice(0, MAX_PHRASES)
-    .flatMap((phrase) => {
-      const base = phrase.trim()
-      const withAsciiHyphen = base.replace(/[–—]/g, '-')
-      const spaced = withAsciiHyphen.replace(/-/g, ' ').replace(/\s+/g, ' ').trim()
-      // Include at most one variant to avoid growing the keyword set too much.
-      return spaced && spaced !== base ? [base, spaced] : [base]
-    })
+  const flat = Array.isArray(source?.claimedSkills)
+    ? source.claimedSkills
+    : Array.isArray(source?.skills)
+      ? source.skills
+      : []
+  return flat.map((value) => sanitize(value)).filter(Boolean)
+}
 
-  // 2) A small set of standalone tokens/acronyms (React, SQL, AWS, etc.)
-  const tokenCandidates: string[] = []
-  for (const phrase of phraseCandidates) {
-    const tokens = phrase.match(/[A-Za-z0-9]+/g) ?? []
-    for (const token of tokens) {
-      const lower = token.toLowerCase()
-      if (!lower || stopwords.has(lower)) continue
-      const isAcronym =
-        token === token.toUpperCase() && /[A-Z]/.test(token) && token.length >= 2 && token.length <= 6
-      if (importantShort.has(lower) || isAcronym || token.length >= 4) tokenCandidates.push(token)
-    }
+// A rendered skills line, split so the category label can be bolded independently of the skills.
+// `label` is empty for the uncategorized fallback, which renders as one plain line.
+type SkillLine = { label: string; skills: string }
+
+// One rendered line per skill category ("Languages: TypeScript, Python"). Falls back to the
+// previous single bullet-separated line when the draft has no categories.
+const buildSkillLines = (draft: ResumeDraft): SkillLine[] => {
+  const categories = (draft.skillCategories ?? [])
+    .map((entry) => ({
+      category: (entry?.category ?? '').trim(),
+      skills: normalizeSkillsForDisplay(entry?.skills ?? []),
+    }))
+    .filter((entry) => entry.category && entry.skills.length > 0)
+
+  if (categories.length > 0) {
+    return categories.map((entry) => ({ label: entry.category, skills: entry.skills.join(', ') }))
   }
 
-  // Sort tokens by "importance-ish" (short important acronyms first, then length).
-  const tokenKeywords = dedupe(tokenCandidates)
-    .sort((a, b) => {
-      const aLower = a.toLowerCase()
-      const bLower = b.toLowerCase()
-      const aBoost = importantShort.has(aLower) ? 2 : a === a.toUpperCase() ? 1 : 0
-      const bBoost = importantShort.has(bLower) ? 2 : b === b.toUpperCase() ? 1 : 0
-      if (aBoost !== bBoost) return bBoost - aBoost
-      return b.length - a.length
-    })
-    .slice(0, MAX_TOKENS)
-
-  // Sort longest-first so phrases match before sub-tokens.
-  const combined = [...phraseKeywords, ...tokenKeywords]
-  return combined
-    .sort((a, b) => b.length - a.length)
-    .slice(0, MAX_TOTAL)
+  const flat = normalizeSkillsForDisplay(draft.skills)
+  return flat.length > 0 ? [{ label: '', skills: flat.join(' • ') }] : []
 }
 
-const normalizeHighlightKey = (value: string) =>
-  (value ?? '')
-    .toLowerCase()
-    .replace(/[–—]/g, '-')
-    .trim()
+// Bucket for skills the user adds by hand when the draft is already categorized.
+const OTHER_SKILL_CATEGORY = 'Additional'
 
-const keywordToRegexPart = (keyword: string) => {
-  // Escape regex metacharacters, then allow any dash variant where '-' appears.
-  const escaped = (keyword ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return escaped.replace(/-/g, '[-–—]')
-}
+const sameSkill = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
 
-const mergeHyphenatedHighlights = <T extends { text: string; bold: boolean }>(tokens: T[]): T[] => {
-  const out: T[] = []
-  for (const token of tokens) {
-    const prev = out[out.length - 1]
-    if (!prev) {
-      out.push(token)
-      continue
-    }
+// Skills and skillCategories must stay in sync: the flat list feeds the saved record while the
+// categories drive the rendered resume, so an edit to one has to be applied to the other.
+const removeSkillFromDraft = (draft: ResumeDraft, skill: string): ResumeDraft => ({
+  ...draft,
+  skills: draft.skills.filter((value) => !sameSkill(value, skill)),
+  skillCategories: draft.skillCategories
+    ? draft.skillCategories
+        .map((entry) => ({ ...entry, skills: entry.skills.filter((value) => !sameSkill(value, skill)) }))
+        .filter((entry) => entry.skills.length > 0)
+    : undefined,
+})
 
-    // Case 1: "data-" (not bold) + "driven" (bold) -> "data-driven" (bold)
-    if (!prev.bold && token.bold && /[-–—]$/.test(prev.text) && /[A-Za-z0-9]$/.test(prev.text.slice(0, -1))) {
-      out[out.length - 1] = { ...(prev as any), text: prev.text + token.text, bold: true }
-      continue
-    }
+const addSkillToDraft = (draft: ResumeDraft, skill: string, category?: string): ResumeDraft => {
+  const trimmed = skill.trim()
+  if (!trimmed || draft.skills.some((value) => sameSkill(value, trimmed))) return draft
 
-    // Case 2: "graph" (bold) + "-based" (not bold) -> "graph-based" (bold)
-    if (prev.bold && !token.bold && /^[-–—][A-Za-z0-9]/.test(token.text) && !/\s/.test(token.text)) {
-      out[out.length - 1] = { ...(prev as any), text: prev.text + token.text, bold: true }
-      continue
-    }
-
-    out.push(token)
+  const categories = draft.skillCategories
+  if (!categories || categories.length === 0) {
+    return { ...draft, skills: [...draft.skills, trimmed] }
   }
-  return out
-}
 
-const limitRepeatedHighlights = <T extends { text: string; bold: boolean }>(tokens: T[]): T[] => {
-  // Reduce noisy repetitive bolding within the same paragraph.
-  const maxTotalBold = 9
-  const counts = new Map<string, number>()
-  let totalBold = 0
+  const target = categories.some((entry) => entry.category === category) ? category : OTHER_SKILL_CATEGORY
+  const nextCategories = categories.some((entry) => entry.category === target)
+    ? categories.map((entry) =>
+        entry.category === target ? { ...entry, skills: [...entry.skills, trimmed] } : entry,
+      )
+    : [...categories, { category: OTHER_SKILL_CATEGORY, skills: [trimmed] }]
 
-  return tokens.map((token) => {
-    if (!token.bold) return token
-
-    const key = normalizeHighlightKey(token.text)
-    const maxPerKey = key.length <= 3 ? 1 : 2
-    const nextCount = (counts.get(key) ?? 0) + 1
-
-    if (totalBold >= maxTotalBold || nextCount > maxPerKey) {
-      return { ...(token as any), bold: false }
-    }
-
-    counts.set(key, nextCount)
-    totalBold += 1
-    return token
-  })
+  return { ...draft, skills: [...draft.skills, trimmed], skillCategories: nextCategories }
 }
 
 const hasMeasurableImpact = (text: unknown) => {
@@ -896,8 +851,10 @@ const wrapTextByMeasure = (args: {
   measure: (s: string) => number
   maxWidth: number
   language: ResumeLanguage
+  // Narrower budget for the first line, to leave room for an inline label drawn before it.
+  firstLineMaxWidth?: number
 }) => {
-  const { text, measure, maxWidth, language } = args
+  const { text, measure, maxWidth, language, firstLineMaxWidth } = args
   const trimmed = text ?? ''
   if (!trimmed) return ['']
 
@@ -909,9 +866,11 @@ const wrapTextByMeasure = (args: {
 
   const lines: string[] = []
   let current = ''
+  const limitFor = (lineIndex: number) =>
+    lineIndex === 0 && typeof firstLineMaxWidth === 'number' ? firstLineMaxWidth : maxWidth
   for (const part of parts) {
     const next = current ? current + part : part
-    if (measure(next) <= maxWidth || !current) {
+    if (measure(next) <= limitFor(lines.length) || !current) {
       current = next
       continue
     }
@@ -954,8 +913,6 @@ const buildResumePdfBlobRasterized = (args: {
   const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' | ')
-
-  const displaySkills = normalizeSkillsForDisplay(draft.skills)
 
   const toRgb = (hex: string) => {
     const normalized = hex.replace('#', '')
@@ -1121,6 +1078,41 @@ const buildResumePdfBlobRasterized = (args: {
     y += Math.round(afterPt * scale)
   }
 
+  // Skills line with a bold category label followed by plain skills on the same line.
+  // The first wrapped line is narrowed by the label width so the two never overlap.
+  const drawSkillLine = (line: SkillLine, afterPt: number) => {
+    const sizePt = 10.5
+    const lineHeightPx = Math.round(16 * scale)
+    const labelText = line.label ? `${line.label}: ` : ''
+
+    setFont(sizePt, true)
+    const labelWidth = labelText ? ctx.measureText(labelText).width : 0
+
+    setFont(sizePt, false)
+    const lines = wrapTextByMeasure({
+      text: line.skills,
+      measure: (s) => ctx.measureText(s).width,
+      maxWidth: maxWidthPx,
+      language,
+      firstLineMaxWidth: maxWidthPx - labelWidth,
+    })
+
+    lines.forEach((text, index) => {
+      // ensureSpace can swap in a fresh page canvas, so re-apply font and color after it.
+      ensureSpace(lineHeightPx)
+      if (index === 0 && labelText) {
+        setFont(sizePt, true)
+        ctx.fillStyle = rgbStr('111111')
+        ctx.fillText(labelText, marginPxX, y)
+      }
+      setFont(sizePt, false)
+      ctx.fillStyle = rgbStr('111111')
+      ctx.fillText(text, index === 0 ? marginPxX + labelWidth : marginPxX, y)
+      y += lineHeightPx
+    })
+    y += Math.round(afterPt * scale)
+  }
+
   const drawBullet = (text: string) => {
     const lineHeightPx = Math.round(16 * scale)
     setFont(10, false)
@@ -1164,8 +1156,10 @@ const buildResumePdfBlobRasterized = (args: {
   if (summary) drawParagraph(summary, 10.5, '111111', 16, 20)
 
   drawSectionHeading(SECTION_LABELS[language].skills)
-  const skillsText = displaySkills.map((s) => s.trim()).filter(Boolean).join(' • ')
-  if (skillsText) drawParagraph(skillsText, 10.5, '111111', 16, 20)
+  const skillLines = buildSkillLines(draft)
+  skillLines.forEach((line, index) =>
+    drawSkillLine(line, index === skillLines.length - 1 ? 20 : 4),
+  )
 
   drawSectionHeading(SECTION_LABELS[language].experience)
   for (const item of draft.workHistory) {
@@ -1298,42 +1292,14 @@ const buildResumePdfBlobDocxStyle = (args: {
     return marginY
   }
 
-  // Keyword highlighting logic matches DOCX generator.
-  // Skills are a flat list (no categories).
-  const displaySkills = normalizeSkillsForDisplay(draft.skills)
-  // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
-  const keywordList = buildImportantHighlightKeywords(displaySkills)
-  const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
-  const globalBoldSeen = new Set<string>()
-  let globalBoldCount = 0
-  const GLOBAL_BOLD_MAX = 9
 
   type Token = { text: string; bold: boolean }
 
   const pdfFontFamily = preset.pdfFontFamily
 
-  const buildHighlightedTokens = (text: string): Token[] => {
-    if (!text) return [{ text, bold: false }]
-    if (keywordList.length === 0) return [{ text, bold: false }]
-    const pattern = new RegExp(
-      `(?<![A-Za-z0-9])(${keywordList.map(keywordToRegexPart).join('|')})(?![A-Za-z0-9])`,
-      'gi',
-    )
-    const raw = text
-      .split(pattern)
-      .filter((chunk) => chunk.length > 0)
-      .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
-    const merged = limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
-    // Bold each keyword at most once across the whole resume.
-    return merged.map((t) => {
-      if (!t.bold) return t
-      const key = normalizeHighlightKey(t.text)
-      if (!key || globalBoldSeen.has(key) || globalBoldCount >= GLOBAL_BOLD_MAX) return { ...t, bold: false }
-      globalBoldSeen.add(key)
-      globalBoldCount += 1
-      return t
-    })
-  }
+  // Body text is never keyword-bolded. Bold is reserved for structural elements
+  // (candidate name, section headings, role titles), which set it explicitly.
+  const buildHighlightedTokens = (text: string): Token[] => [{ text, bold: false }]
 
   const expandWhitespace = (tokens: Token[]) => {
     const expanded: Token[] = []
@@ -1548,19 +1514,25 @@ const buildResumePdfBlobDocxStyle = (args: {
   }
 
   y = drawSectionHeading(SECTION_LABELS[language].skills, y)
-  const skillsText = displaySkills.map((s) => s.trim()).filter(Boolean).join(' • ')
-  if (skillsText) {
-    y = drawWrappedTokens({
-      // Skills should be plain (no keyword bolding).
-      tokens: [{ text: skillsText, bold: false }],
-      x: marginX,
-      y,
-      maxWidth,
-      fontSize: 10,
-      lineHeight: 14,
-      colorHex: '111111',
-    })
-    y += 16
+  const skillLines = buildSkillLines(draft)
+  if (skillLines.length > 0) {
+    for (const line of skillLines) {
+      y = drawWrappedTokens({
+        // Category label is bold; the skills themselves stay plain (no keyword bolding).
+        tokens: [
+          ...(line.label ? [{ text: `${line.label}: `, bold: true }] : []),
+          { text: line.skills, bold: false },
+        ],
+        x: marginX,
+        y,
+        maxWidth,
+        fontSize: 10,
+        lineHeight: 14,
+        colorHex: '111111',
+      })
+      y += 14
+    }
+    y += 2
   } else {
     y += 10
   }
@@ -1881,12 +1853,21 @@ export default function ResumeBuilder() {
   })
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [isDownloading, setIsDownloading] = useState(false)
   const [isSaved, setIsSaved] = useState(false)
   const [hasGenerated, setHasGenerated] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [skillInput, setSkillInput] = useState('')
+  const [skillCategoryInput, setSkillCategoryInput] = useState('')
   const [downloadHandle, setDownloadHandle] = useState<FileSystemDirectoryHandle | null>(null)
   const [downloadHandleName, setDownloadHandleName] = useState<string | null>(null)
+  const [resultDialog, setResultDialog] = useState<{
+    companyName: string
+    jobTitle: string
+    rootFolderName: string | null
+    folderName: string
+    files: string[]
+  } | null>(null)
 
   useEffect(() => {
     try {
@@ -2087,6 +2068,22 @@ export default function ResumeBuilder() {
     setHasGenerated(false)
   }
 
+  // Regenerating replaces the category set, so a previously picked category can go stale.
+  // Resolve once here so the dropdown and the add action always agree on the target.
+  const skillCategoryNames = (draft.skillCategories ?? []).map((entry) => entry.category)
+  const resolvedSkillCategory =
+    skillCategoryInput &&
+    (skillCategoryNames.includes(skillCategoryInput) || skillCategoryInput === OTHER_SKILL_CATEGORY)
+      ? skillCategoryInput
+      : (skillCategoryNames[0] ?? '')
+
+  const handleAddSkill = () => {
+    const nextSkill = skillInput.trim()
+    if (!nextSkill) return
+    updateDraft((prev) => addSkillToDraft(prev, nextSkill, resolvedSkillCategory || undefined))
+    setSkillInput('')
+  }
+
   const handleReset = () => {
     setDraft(baseDraft)
     setNotes('')
@@ -2095,10 +2092,12 @@ export default function ResumeBuilder() {
     setQaError(null)
     setCompanyName('')
     setJobTitle('')
+    setJobUrl('')
     setError(null)
     setIsSaved(false)
     setIsDraftDirty(false)
     setHasGenerated(false)
+    setResultDialog(null)
   }
 
   const handleGenerateAnswers = async () => {
@@ -2246,21 +2245,67 @@ A: <answer>
   ): ResumeDraft => {
     const { parsed, parsedWithTitles, jobTitleFallback } = args
 
-    // determine flattened claimed skills and optional display lines
+    // determine grouped skill categories and the flattened list that mirrors them
     let flatSkills: string[] | undefined = undefined
-    const skillDisplayLines: string[] | undefined = undefined
+    let skillCategories: SkillCategory[] | undefined = undefined
+
+    // Keeps each skill in exactly one category, preserving the model's ordering.
+    const toSkillCategories = (raw: Record<string, unknown>): SkillCategory[] => {
+      const seen = new Set<string>()
+      const out: SkillCategory[] = []
+      for (const [rawCategory, rawSkills] of Object.entries(raw ?? {})) {
+        const category = (rawCategory ?? '').toString().trim()
+        const skills: string[] = []
+        for (const value of Array.isArray(rawSkills) ? rawSkills : []) {
+          const skill = (value ?? '').toString().trim()
+          if (!skill) continue
+          const key = skill.toLowerCase()
+          if (seen.has(key)) continue
+          seen.add(key)
+          skills.push(skill)
+        }
+        if (category && skills.length > 0) out.push({ category, skills })
+      }
+      return out
+    }
+
+    // Fallback for a flat list where the model still encoded groups as "Category: a, b".
+    const skillCategoriesFromFlat = (values: string[]): SkillCategory[] => {
+      const out: SkillCategory[] = []
+      for (const value of values) {
+        const idx = value.indexOf(':')
+        if (idx <= 0) continue
+        const category = value.slice(0, idx).trim()
+        const skills = value
+          .slice(idx + 1)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        if (category && skills.length > 0) out.push({ category, skills })
+      }
+      return out
+    }
 
     if (parsedWithTitles?.claimedSkillsByCategory && typeof parsedWithTitles.claimedSkillsByCategory === 'object') {
       // prefer categorized response
-      const cat = parsedWithTitles.claimedSkillsByCategory as Record<string, string[]>
-      flatSkills = Array.from(new Set((Object.values(cat) ?? []).flat().map((s) => (s ?? '').trim()).filter(Boolean)))
+      skillCategories = toSkillCategories(parsedWithTitles.claimedSkillsByCategory as Record<string, unknown>)
+      flatSkills = skillCategories.flatMap((entry) => entry.skills)
     } else if (Array.isArray(parsedWithTitles?.claimedSkills)) {
       // fallback: model returned flat claimedSkills
-      flatSkills = parsedWithTitles.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+      const values = parsedWithTitles.claimedSkills.map((s: string) => (s ?? '').trim()).filter(Boolean)
+      const derived = skillCategoriesFromFlat(values)
+      if (derived.length > 0) {
+        skillCategories = derived
+        flatSkills = derived.flatMap((entry) => entry.skills)
+      } else {
+        flatSkills = values
+      }
     } else if (Array.isArray(parsedWithTitles?.skills)) {
       // legacy fallback
       flatSkills = parsedWithTitles.skills.map((s: string) => (s ?? '').trim()).filter(Boolean)
     }
+
+    if (skillCategories && skillCategories.length === 0) skillCategories = undefined
 
     // helper to sanitize text returned from the model (single-line)
     const sanitizeText = (s: string) =>
@@ -2409,7 +2454,8 @@ A: <answer>
       const deduped: string[] = []
 
       for (const raw of incoming.map((b: string) => (b ?? '').trim()).filter(Boolean)) {
-        const b = sanitizeText(raw)
+        const b = stripPlaceholderMetrics(stripBracketedMetrics(sanitizeText(raw)))
+        if (!b) continue
         const key = normalize(b)
 
         if (localSeen.has(key) || globalSeen.has(key)) {
@@ -2455,16 +2501,23 @@ A: <answer>
     return {
       ...prev,
       targetTitle: parsedWithTitles?.targetTitle ? sanitizeText(parsedWithTitles.targetTitle) : prev.targetTitle,
-      summary: parsedWithTitles?.summary ? sanitizeText(parsedWithTitles.summary) : prev.summary,
+      summary: parsedWithTitles?.summary
+        ? stripPlaceholderMetrics(sanitizeText(parsedWithTitles.summary))
+        : prev.summary,
       skills: Array.isArray(flatSkills) && flatSkills.length > 0 ? flatSkills : prev.skills,
-      skillDisplayLines,
-      coverLetter: parsedWithTitles?.coverLetter ? sanitizeMultilineText(parsedWithTitles.coverLetter) : prev.coverLetter,
+      skillCategories:
+        Array.isArray(flatSkills) && flatSkills.length > 0 ? skillCategories : prev.skillCategories,
+      coverLetter: parsedWithTitles?.coverLetter
+        ? stripPlaceholderMetrics(sanitizeMultilineText(parsedWithTitles.coverLetter))
+        : prev.coverLetter,
       keyAchievements: Array.isArray(parsedWithTitles?.keyAchievements)
-        ? parsedWithTitles.keyAchievements.map((s: string) => stripBracketedMetrics(sanitizeText(s))).filter(Boolean)
+        ? parsedWithTitles.keyAchievements
+            .map((s: string) => stripPlaceholderMetrics(stripBracketedMetrics(sanitizeText(s))))
+            .filter(Boolean)
         : prev.keyAchievements,
       projects: Array.isArray(parsedWithTitles?.projects)
         ? parsedWithTitles.projects
-            .map((s: string) => stripTrailingEstimateTag(stripBracketedMetrics(sanitizeText(s))))
+            .map((s: string) => stripPlaceholderMetrics(stripTrailingEstimateTag(stripBracketedMetrics(sanitizeText(s)))))
             .filter(Boolean)
         : prev.projects,
       workHistory,
@@ -2664,6 +2717,20 @@ A: <answer>
       }
     }
 
+    if (!profile?.id) {
+      const msg = 'Unable to save without a profile.'
+      setError(msg)
+      toast.error(msg)
+      return
+    }
+
+    if (!downloadHandle) {
+      const msg = 'Please choose a download folder before generating.'
+      setError(msg)
+      toast.error(msg)
+      return
+    }
+
     setIsGenerating(true)
     setError(null)
 
@@ -2705,8 +2772,14 @@ A: <answer>
         start: item.start,
         end: item.end,
         location: item.location,
+        // Candidate-authored bullets. These are the only trustworthy source of real metrics,
+        // so they must be sent to the model rather than dropped.
+        existingBullets: collectEvidenceLines(item.bullets),
       })),
       education: draft.education,
+      // Candidate-authored achievements/projects, also a source of real metrics.
+      existingKeyAchievements: collectEvidenceLines(draft.keyAchievements),
+      existingProjects: collectEvidenceLines(draft.projects),
       notes,
     }
 
@@ -2724,7 +2797,7 @@ A: <answer>
             {
               role: 'system',
               content:
-                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkills, workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkillsByCategory (object of category name -> array of skill strings), workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
             },
             {
               role: 'user',
@@ -2750,7 +2823,7 @@ INSTRUCTIONS:
    - Every returned workHistory entry MUST include a non-empty resumeTitle string.
 0.4 Key Achievements + Projects (required):
    - keyAchievements MUST be a non-empty array with 5–6 items.
-   - Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary, use placeholders like "X%" (no brackets) and record them in 'notes'.
+   - Every keyAchievements item SHOULD include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.), taken from the candidate's real metrics per section 0.5.
    - projects MUST be an array with EXACTLY 3 items.
    - Each project must be extremely relevant to the job description.
    - Each project item must be ONE sentence and must include ALL of:
@@ -2759,6 +2832,17 @@ INSTRUCTIONS:
      c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
    - Each item must be action/outcome oriented and aligned to the target role/JD.
    - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
+0.5 Real metrics (required, strict):
+   - The candidate's real, verifiable numbers live ONLY in these payload fields: workHistory[].existingBullets, existingKeyAchievements, existingProjects, and summary.
+   - FIRST, scan all of those fields end-to-end and extract every number you find: percentages, currency amounts, multipliers (2x), latency values (ms, p95/p99), counts, team/user/request volumes, durations, and frequencies.
+   - Reuse those extracted numbers LIBERALLY and carry each one through VERBATIM (do not round, rescale, or alter a real number). Aim to surface every extracted metric at least once somewhere in the resume.
+   - Attribute each metric to the SAME role it came from (match by workHistory id). Do not move a metric from one company to another.
+   - You MAY rewrite the wording, tense, framing, and technology emphasis around a real number to fit the target role, as long as the number and the accomplishment it belongs to stay factually intact.
+   - You MAY restate the same underlying metric in a different section (e.g., a strong number in both keyAchievements and the relevant role bullet), but do not present one metric as if it were several separate wins.
+   - NEVER invent, estimate, extrapolate, or guess a number that is not present in the payload fields above.
+   - NEVER write a literal placeholder metric such as "X%", "X percent", "[X%]", "N%", or "Y hours" in any visible output text.
+   - If the payload contains few or no numbers, that is expected and acceptable: write those bullets with concrete NON-numeric specificity instead (systems owned, scope, technologies, stakeholders, before/after behavior, qualitative outcome). Do not pad with vague filler and do not substitute a fake number.
+   - In the 'notes' field, list which sections lacked real metrics so the candidate knows exactly where to add their own numbers.
 1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
 2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
 3. Do not summarize or paraphrase the job description before processing.
@@ -2787,8 +2871,14 @@ INSTRUCTIONS:
 23. Each bullet must be one sentence only. No paragraphs.
 24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
 25. The bullets should be outcome-driven and should include real metrics results as much as possible.
-27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
-28. Include 18–28 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
+27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
+27.1 Derive 6–9 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration). Use the job's own vocabulary for category names, and do not create categories the role does not care about.
+27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category the same way.
+27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
+27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
+28. Include 30–45 skills IN TOTAL across all categories (roughly 4–8 per category), all relevant to the job description. Be comprehensive about the job description's stack: languages, frameworks, libraries, datastores, cloud services, infrastructure and CI/CD tooling, testing tools, APIs/protocols/data formats, monitoring, and ways of working. Prefer a rich, specific list over a short generic one.
+28.1 Do not pad the list with vague filler ("problem solving", "hard working") or with near-duplicates of a skill already listed; every entry must be a concrete, nameable technology, tool, or practice.
+28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 30 skills, output fewer rather than inventing expertise the candidate does not have.
 29. All job-description technologies must appear in both Skills and Experience sections.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
@@ -2798,14 +2888,15 @@ Additional rules (apply exactly):
 
 - Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
 
-- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkills (string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
+- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
 - Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
   - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
 
 - Measurable impact (required):
-  - Include at least 5 measurable, specific impact statements across the resume output (keyAchievements and/or workHistory bullets).
-  - Do not fabricate numbers; use placeholders like "X%" only when necessary (no brackets) and note them in 'notes'.
+  - Surface EVERY real number available in the payload (see section 0.5) at least once across the resume output, and prefer placing the strongest ones in keyAchievements and in the most relevant role's bullets.
+  - Include as many genuinely measurable impact statements as the candidate's real data supports — do not cap yourself at a minimum count, and do not stop early if more real numbers remain unused.
+  - The ONLY hard limit is truthfulness: never fabricate, estimate, or placeholder a number (see section 0.5). A resume with fewer real metrics is correct; a resume with invented metrics is not.
 
 - Bullets (strict):
   - Every bullet must be generated by you, be a single sentence, and be at least 25 words long.
@@ -2813,11 +2904,12 @@ Additional rules (apply exactly):
   - Bullets must be action-oriented, concrete, mention technologies when relevant, and align with the provided job description (payload.notes).
   - Follow the structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
   - Do NOT include company names or date ranges inside bullets.
-  - Prefer measurable outcomes in MOST bullets, but never fabricate numbers; use placeholders when necessary and record them in 'notes'.
+  - Treat workHistory[].existingBullets as the candidate's own source material: preserve every real number in them verbatim (per section 0.5), and rewrite the surrounding wording to target the role rather than discarding the bullet.
+  - Prefer measurable outcomes in as many bullets as the candidate's real numbers allow, but never fabricate or placeholder a number (see section 0.5); bullets with no real number available must instead be concrete and specific in non-numeric terms.
   - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
 
 - Skills:
-  - Output claimedSkills as a flat array of strings (no categories).
+  - Output claimedSkillsByCategory as an object of category name -> array of skill strings, following rules 27–27.4. Do NOT output a flat claimedSkills array.
   - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
   - All job-description technologies (P1/P2) must appear in both Skills and Experience sections.
 
@@ -2869,20 +2961,21 @@ If you understand, return the single JSON object now.`,
       }
 
       const ensureSkills = async (draftParsed: any) => {
-        const existing = Array.isArray(draftParsed?.claimedSkills)
-          ? draftParsed.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-          : Array.isArray(draftParsed?.skills)
-            ? draftParsed.skills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-            : []
+        const existing = flattenClaimedSkills(draftParsed, sanitizeModelText)
 
         const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-        if (unique.length >= 18) return draftParsed
+        if (unique.length >= 24) {
+          // Keep the flat mirror in sync for the downstream repair passes.
+          draftParsed.claimedSkills = unique
+          return draftParsed
+        }
 
         const repairPayload = {
           resumeLanguage,
           targetJobTitle: jobTitle,
           jobDescription: notes,
           existingSkills: unique,
+          existingCategories: draftParsed?.claimedSkillsByCategory ?? {},
           // provide evidence sources: profile skills + generated workHistory bullets (post-generation will include JD tech)
           payloadSkills: payload.skills ?? [],
           workHistory: payload.workHistory ?? [],
@@ -2900,14 +2993,21 @@ If you understand, return the single JSON object now.`,
             messages: [
               {
                 role: 'system',
-                content: 'Output ONLY valid JSON (no markdown). Return: { claimedSkills: string[] } and nothing else.',
+                content:
+                  'Output ONLY valid JSON (no markdown). Return: { claimedSkillsByCategory: { [category: string]: string[] } } and nothing else.',
               },
               {
                 role: 'user',
-                content: `Expand the resume claimedSkills list to 18–28 items, prioritizing job-description relevance.
+                content: `Expand the resume skills to 30–45 items IN TOTAL, grouped into categories, prioritizing job-description relevance.
 
 Rules:
-- Output claimedSkills as a flat string array.
+- Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
+- Use 6–9 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration), using the job's own vocabulary.
+- Aim for roughly 4–8 skills per category and cover the job description's stack comprehensively (languages, frameworks, datastores, cloud, CI/CD, testing, APIs/protocols, monitoring, ways of working).
+- Do not pad with vague filler ("problem solving", "team player") or near-duplicates; every entry must be a concrete, nameable technology, tool, or practice.
+- Order categories by relevance to the job description (most relevant first), and order skills within each category the same way.
+- Every skill must appear in exactly ONE category (no duplicates across categories).
+- Avoid a generic "Other"/"Miscellaneous" category unless a relevant skill fits nowhere else.
 - Include all P1/P2 job-description technologies.
 - Do not invent certifications or tools with no plausible evidence; if adding a JD tool not present in payloadSkills, it must be consistent with the work history context.
 - Keep items concise (1–3 words each where possible), deduplicate, and avoid near-duplicates.
@@ -2924,11 +3024,12 @@ ${JSON.stringify(repairPayload)}`,
 
         const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
         const repaired = parseModelJson(repairContent)
-        const next = Array.isArray(repaired?.claimedSkills)
-          ? repaired.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-          : []
-        if (next.length >= 18) {
-          draftParsed.claimedSkills = next.slice(0, 28)
+        const nextCategories = repaired?.claimedSkillsByCategory
+        const next = flattenClaimedSkills(repaired, sanitizeModelText)
+        // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
+        if (next.length > unique.length) {
+          draftParsed.claimedSkillsByCategory = nextCategories
+          draftParsed.claimedSkills = next.slice(0, 45)
         }
         return draftParsed
       }
@@ -3018,8 +3119,13 @@ ${JSON.stringify(repairPayload)}`,
           ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
           : []
 
-        const measurableAchievements = existingAchievements.filter((a: string) => hasMeasurableImpact(a))
-        const needsAchievements = existingAchievements.length < 5 || measurableAchievements.length < 5
+        // Counted only as context for the model. Do NOT gate the repair call on this: demanding a
+        // fixed quota of measurable items when the candidate supplied no numbers is exactly what
+        // pushed the model into emitting "X%" placeholders.
+        const metricBackedAchievementCount = existingAchievements.filter((a: string) =>
+          hasMeasurableImpact(a),
+        ).length
+        const needsAchievements = existingAchievements.length < 5
         const needsProjects = existingProjects.length === 0
         if (!needsAchievements && !needsProjects) return draftParsed
 
@@ -3036,6 +3142,13 @@ ${JSON.stringify(repairPayload)}`,
             company: w.company ?? '',
             bullets: w.bullets ?? [],
           })),
+          metricBackedAchievementCount,
+          // The candidate's own words, so the repair pass can reuse real numbers instead of inventing them.
+          candidateRealMetricsSource: {
+            existingBullets: payload.workHistory.flatMap((w) => w.existingBullets ?? []),
+            existingKeyAchievements: payload.existingKeyAchievements,
+            existingProjects: payload.existingProjects,
+          },
         }
 
         const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -3055,7 +3168,7 @@ ${JSON.stringify(repairPayload)}`,
               },
               {
                 role: 'user',
-                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary use placeholders like \"X%\" (no brackets) and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+                content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Real metrics (strict): payload.candidateRealMetricsSource holds the candidate's own words and is the ONLY source of real numbers. Extract every number in it (%, $, multipliers, ms/p95/p99, counts, volumes, durations) and reuse them VERBATIM across the achievements you write, keeping each number attached to the accomplishment it came from.\n- Prefer measurable impact for every keyAchievements item, but NEVER invent, estimate, or extrapolate a number, and NEVER write a literal placeholder such as "X%", "X percent", "[X%]", or "N%". If no real number is available for an item, make it concrete in non-numeric terms (scope, systems, technologies, before/after behavior) instead.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                   repairPayload,
                 )}`,
               },
@@ -3083,17 +3196,41 @@ ${JSON.stringify(repairPayload)}`,
 
       const parsedWithTitles = await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed)))
 
-      updateDraft((prev) =>
-        applyParsedToDraft(prev, { parsed, parsedWithTitles, jobTitleFallback: generalizedJobTitle }),
-      )
+      const nextDraft = applyParsedToDraft(draft, {
+        parsed,
+        parsedWithTitles,
+        jobTitleFallback: generalizedJobTitle,
+      })
+      setDraft(nextDraft)
+      setIsDraftDirty(true)
       setHasGenerated(true)
+      setIsGenerating(false)
+
+      const saveResult = await performSave(nextDraft)
+      if (!saveResult.ok) return
+
+      const downloadResult = await performDownload({
+        draft: nextDraft,
+        companyName,
+        jobTitle,
+        jobUrl,
+        notes,
+      })
+      if (!downloadResult.ok || !downloadResult.folderName || !downloadResult.files) return
+
+      setResultDialog({
+        companyName: companyName.trim(),
+        jobTitle: generalizedJobTitle,
+        rootFolderName: downloadHandleName,
+        folderName: downloadResult.folderName,
+        files: downloadResult.files,
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
       updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, generalizedJobTitle))
       setHasGenerated(true)
-    } finally {
       setIsGenerating(false)
     }
   }
@@ -3137,8 +3274,13 @@ ${JSON.stringify(repairPayload)}`,
         start: wh.start,
         end: wh.end,
         location: wh.location,
+        // Candidate-authored bullets carried from the builder draft snapshot: the only
+        // trustworthy source of real metrics for every job in the batch.
+        existingBullets: collectEvidenceLines(wh.bullets),
       })),
       education: base.education,
+      existingKeyAchievements: collectEvidenceLines(base.keyAchievements),
+      existingProjects: collectEvidenceLines(base.projects),
       notes: notesInput,
     }
 
@@ -3155,7 +3297,7 @@ ${JSON.stringify(repairPayload)}`,
           {
             role: 'system',
             content:
-              'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkills, workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+              'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkillsByCategory (object of category name -> array of skill strings), workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
           },
           {
             role: 'user',
@@ -3189,6 +3331,17 @@ INSTRUCTIONS:
      c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
    - Each item must be action/outcome oriented and aligned to the target role/JD.
    - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
+0.5 Real metrics (required, strict):
+   - The candidate's real, verifiable numbers live ONLY in these payload fields: workHistory[].existingBullets, existingKeyAchievements, existingProjects, and summary.
+   - FIRST, scan all of those fields end-to-end and extract every number you find: percentages, currency amounts, multipliers (2x), latency values (ms, p95/p99), counts, team/user/request volumes, durations, and frequencies.
+   - Reuse those extracted numbers LIBERALLY and carry each one through VERBATIM (do not round, rescale, or alter a real number). Aim to surface every extracted metric at least once somewhere in the resume.
+   - Attribute each metric to the SAME role it came from (match by workHistory id). Do not move a metric from one company to another.
+   - You MAY rewrite the wording, tense, framing, and technology emphasis around a real number to fit the target role, as long as the number and the accomplishment it belongs to stay factually intact.
+   - You MAY restate the same underlying metric in a different section (e.g., a strong number in both keyAchievements and the relevant role bullet), but do not present one metric as if it were several separate wins.
+   - NEVER invent, estimate, extrapolate, or guess a number that is not present in the payload fields above.
+   - NEVER write a literal placeholder metric such as "X%", "X percent", "[X%]", "N%", or "Y hours" in any visible output text.
+   - If the payload contains few or no numbers, that is expected and acceptable: write those bullets with concrete NON-numeric specificity instead (systems owned, scope, technologies, stakeholders, before/after behavior, qualitative outcome). Do not pad with vague filler and do not substitute a fake number.
+   - In the 'notes' field, list which sections lacked real metrics so the candidate knows exactly where to add their own numbers.
 1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
 2. Treat the job description as the single source of truth for keywords, technologies, architecture terms, tools, and expectations.
 3. Do not summarize or paraphrase the job description before processing.
@@ -3217,8 +3370,14 @@ INSTRUCTIONS:
 23. Each bullet must be one sentence only. No paragraphs.
 24. Every experience bullet must follow this structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
 25. The bullets should be outcome-driven and should include real metrics results as much as possible.
-27. Skills must be a simple flat list (NOT categorized). Output claimedSkills as a plain array of strings.
-28. Include 18–28 skills that are most relevant to the job description; omit irrelevant skills rather than diluting focus.
+27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
+27.1 Derive 6–9 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration). Use the job's own vocabulary for category names, and do not create categories the role does not care about.
+27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category the same way.
+27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
+27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
+28. Include 30–45 skills IN TOTAL across all categories (roughly 4–8 per category), all relevant to the job description. Be comprehensive about the job description's stack: languages, frameworks, libraries, datastores, cloud services, infrastructure and CI/CD tooling, testing tools, APIs/protocols/data formats, monitoring, and ways of working. Prefer a rich, specific list over a short generic one.
+28.1 Do not pad the list with vague filler ("problem solving", "hard working") or with near-duplicates of a skill already listed; every entry must be a concrete, nameable technology, tool, or practice.
+28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 30 skills, output fewer rather than inventing expertise the candidate does not have.
 29. All job-description technologies must appear in both Skills and Experience sections.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, validate that all P1 and P2 keywords are included and used in logical contexts.
@@ -3228,7 +3387,7 @@ Additional rules (apply exactly):
 
 - Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
 
-- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkills (string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
+- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
 - Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
   - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
@@ -3239,11 +3398,12 @@ Additional rules (apply exactly):
   - Bullets must be action-oriented, concrete, mention technologies when relevant, and align with the provided job description (payload.notes).
   - Follow the structure: Action Verb -> What was done -> Technologies used -> Outcome or impact.
   - Do NOT include company names or date ranges inside bullets.
-  - Prefer measurable outcomes in MOST bullets, but never fabricate numbers; use placeholders when necessary and record them in 'notes'.
+  - Treat workHistory[].existingBullets as the candidate's own source material: preserve every real number in them verbatim (per section 0.5), and rewrite the surrounding wording to target the role rather than discarding the bullet.
+  - Prefer measurable outcomes in as many bullets as the candidate's real numbers allow, but never fabricate or placeholder a number (see section 0.5); bullets with no real number available must instead be concrete and specific in non-numeric terms.
   - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
 
 - Skills:
-  - Output claimedSkills as a flat array of strings (no categories).
+  - Output claimedSkillsByCategory as an object of category name -> array of skill strings, following rules 27–27.4. Do NOT output a flat claimedSkills array.
   - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
   - All job-description technologies (P1/P2) must appear in both Skills and Experience sections.
 
@@ -3295,20 +3455,21 @@ If you understand, return the single JSON object now.`,
     }
 
     const ensureSkills = async (draftParsed: any) => {
-      const existing = Array.isArray(draftParsed?.claimedSkills)
-        ? draftParsed.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-        : Array.isArray(draftParsed?.skills)
-          ? draftParsed.skills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-          : []
+      const existing = flattenClaimedSkills(draftParsed, sanitizeModelText)
 
       const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-      if (unique.length >= 18) return draftParsed
+      if (unique.length >= 24) {
+        // Keep the flat mirror in sync for the downstream repair passes.
+        draftParsed.claimedSkills = unique
+        return draftParsed
+      }
 
       const repairPayload = {
         resumeLanguage,
         targetJobTitle: generalizedJobTitleInput,
         jobDescription: notesInput,
         existingSkills: unique,
+        existingCategories: draftParsed?.claimedSkillsByCategory ?? {},
         payloadSkills: payload.skills ?? [],
         workHistory: payload.workHistory ?? [],
       }
@@ -3325,14 +3486,21 @@ If you understand, return the single JSON object now.`,
           messages: [
             {
               role: 'system',
-              content: 'Output ONLY valid JSON (no markdown). Return: { claimedSkills: string[] } and nothing else.',
+              content:
+                'Output ONLY valid JSON (no markdown). Return: { claimedSkillsByCategory: { [category: string]: string[] } } and nothing else.',
             },
             {
               role: 'user',
-              content: `Expand the resume claimedSkills list to 18–28 items, prioritizing job-description relevance.
+              content: `Expand the resume skills to 30–45 items IN TOTAL, grouped into categories, prioritizing job-description relevance.
 
 Rules:
-- Output claimedSkills as a flat string array.
+- Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
+- Use 6–9 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration), using the job's own vocabulary.
+- Aim for roughly 4–8 skills per category and cover the job description's stack comprehensively (languages, frameworks, datastores, cloud, CI/CD, testing, APIs/protocols, monitoring, ways of working).
+- Do not pad with vague filler ("problem solving", "team player") or near-duplicates; every entry must be a concrete, nameable technology, tool, or practice.
+- Order categories by relevance to the job description (most relevant first), and order skills within each category the same way.
+- Every skill must appear in exactly ONE category (no duplicates across categories).
+- Avoid a generic "Other"/"Miscellaneous" category unless a relevant skill fits nowhere else.
 - Include all P1/P2 job-description technologies.
 - Do not invent certifications or tools with no plausible evidence; if adding a JD tool not present in payloadSkills, it must be consistent with the work history context.
 - Keep items concise (1–3 words each where possible), deduplicate, and avoid near-duplicates.
@@ -3349,11 +3517,12 @@ ${JSON.stringify(repairPayload)}`,
 
       const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
       const repaired = parseModelJson(repairContent)
-      const next = Array.isArray(repaired?.claimedSkills)
-        ? repaired.claimedSkills.map((s: unknown) => sanitizeModelText(s)).filter(Boolean)
-        : []
-      if (next.length >= 18) {
-        draftParsed.claimedSkills = next.slice(0, 28)
+      const nextCategories = repaired?.claimedSkillsByCategory
+      const next = flattenClaimedSkills(repaired, sanitizeModelText)
+      // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
+      if (next.length > unique.length) {
+        draftParsed.claimedSkillsByCategory = nextCategories
+        draftParsed.claimedSkills = next.slice(0, 45)
       }
       return draftParsed
     }
@@ -3440,8 +3609,11 @@ ${JSON.stringify(repairPayload)}`,
         ? draftParsed.projects.map((s: unknown) => stripTrailingEstimateTag(sanitizeModelText(s))).filter(Boolean)
         : []
 
-      const measurableAchievements = existingAchievements.filter((a: string) => hasMeasurableImpact(a))
-      const needsAchievements = existingAchievements.length < 5 || measurableAchievements.length < 5
+      // Counted only as context for the model — see the note in the single-generation copy above.
+      const metricBackedAchievementCount = existingAchievements.filter((a: string) =>
+        hasMeasurableImpact(a),
+      ).length
+      const needsAchievements = existingAchievements.length < 5
       const needsProjects = existingProjects.length === 0
       if (!needsAchievements && !needsProjects) return draftParsed
 
@@ -3458,6 +3630,13 @@ ${JSON.stringify(repairPayload)}`,
           company: w.company ?? '',
           bullets: w.bullets ?? [],
         })),
+        metricBackedAchievementCount,
+        // The candidate's own words, so the repair pass can reuse real numbers instead of inventing them.
+        candidateRealMetricsSource: {
+          existingBullets: payload.workHistory.flatMap((w) => w.existingBullets ?? []),
+          existingKeyAchievements: payload.existingKeyAchievements,
+          existingProjects: payload.existingProjects,
+        },
       }
 
       const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -3476,7 +3655,7 @@ ${JSON.stringify(repairPayload)}`,
             },
             {
               role: 'user',
-              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Every keyAchievements item MUST include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.). Do not fabricate numbers; if necessary use placeholders like \"X%\" (no brackets) and record them in the resume 'notes'.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
+              content: `Generate Key Achievements and Projects for this resume.\n\nRules:\n- keyAchievements: 5–6 items.\n- Real metrics (strict): payload.candidateRealMetricsSource holds the candidate's own words and is the ONLY source of real numbers. Extract every number in it (%, $, multipliers, ms/p95/p99, counts, volumes, durations) and reuse them VERBATIM across the achievements you write, keeping each number attached to the accomplishment it came from.\n- Prefer measurable impact for every keyAchievements item, but NEVER invent, estimate, or extrapolate a number, and NEVER write a literal placeholder such as "X%", "X percent", "[X%]", or "N%". If no real number is available for an item, make it concrete in non-numeric terms (scope, systems, technologies, before/after behavior) instead.\n- projects: EXACTLY 3 items.\n- Each project must be extremely relevant to the job description.\n- Each project item must be ONE sentence and must include ALL of:\n  a) a real user story (explicitly name the user persona and goal),\n  b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),\n  c) the outcome/impact (include metrics if available; if you must estimate, do NOT add \"(est.)\"; write it naturally).\n- Use measurable outcomes when reasonable; if you must estimate, do NOT add \"(est.)\".\n- Do not invent company names.\n\nPayload:\n${JSON.stringify(
                 repairPayload,
               )}`,
             },
@@ -3679,43 +3858,38 @@ ${JSON.stringify(repairPayload)}`,
     }
   }
 
-  const handleSave = async () => {
-    if (isSaved || isSaving) return
-    if (!hasGenerated) {
-      const msg = 'Please generate a resume before saving.'
-      setError(msg)
-      toast.error(msg)
-      return
-    }
+  const performSave = async (
+    draftToSave: ResumeDraft,
+  ): Promise<{ ok: boolean; fileNames?: SavedFiles }> => {
     if (!profile?.id) {
       const msg = 'Unable to save without a profile.'
       setError(msg)
       toast.error(msg)
-      return
+      return { ok: false }
     }
     if (!companyName.trim()) {
       const msg = 'Please enter a company name before saving.'
       setError(msg)
       toast.error(msg)
-      return
+      return { ok: false }
     }
     if (!jobTitle.trim()) {
       const msg = 'Please enter a job title before saving.'
       setError(msg)
       toast.error(msg)
-      return
+      return { ok: false }
     }
     if (!jobUrl.trim()) {
       const msg = 'Please enter a Job URL before saving.'
       setError(msg)
       toast.error(msg)
-      return
+      return { ok: false }
     }
     if (!notes.trim()) {
       const msg = 'Please add a job description before saving.'
       setError(msg)
       toast.error(msg)
-      return
+      return { ok: false }
     }
 
     setIsSaving(true)
@@ -3730,19 +3904,31 @@ ${JSON.stringify(repairPayload)}`,
       job_description: notes.trim(),
       resume_name: fileNames.resume,
       cover_letter_name: fileNames.coverLetter,
-      skills: draft.skills,
+      skills: draftToSave.skills,
     })
 
     if (insertError) {
       setError(insertError.message)
       toast.error(insertError.message)
       setIsSaving(false)
-      return
+      return { ok: false }
     }
 
     // filenames persisted to DB via resume_name / cover_letter_name; no local savedFiles state
     setIsSaved(true)
     setIsSaving(false)
+    return { ok: true, fileNames }
+  }
+
+  const handleSave = async () => {
+    if (isSaved || isSaving) return
+    if (!hasGenerated) {
+      const msg = 'Please generate a resume before saving.'
+      setError(msg)
+      toast.error(msg)
+      return
+    }
+    await performSave(draft)
   }
 
   const moveItem = (items: string[], from: number, to: number) => {
@@ -3765,10 +3951,6 @@ ${JSON.stringify(repairPayload)}`,
     const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(' | ')
-    // Skills are a flat list (no categories).
-    const displaySkills = normalizeSkillsForDisplay(draftToSave.skills)
-    // Only bold meaningful phrases/tokens (avoid noisy bolding like "a", "data", "time").
-    const keywordList = buildImportantHighlightKeywords(displaySkills)
     const preset = getResumeStylePreset(resumeStyle)
     const experienceRightIndent = 360
     const docxMarginTwipsX = preset.docxMarginTwipsX ?? preset.docxMarginTwips ?? 1080
@@ -3781,36 +3963,11 @@ ${JSON.stringify(repairPayload)}`,
     const headerNameColor =
       resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
     const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
-    const keywordKeySet = new Set(keywordList.map((k) => normalizeHighlightKey(k)))
-    const globalBoldSeen = new Set<string>()
-    let globalBoldCount = 0
-    const GLOBAL_BOLD_MAX = 9
-    const buildHighlightedRuns = (text: string, size = 21) => {
-      if (!text) return [new TextRun({ text, size, color: '111111', font: fontFamily })]
-      if (keywordList.length === 0) {
-        return [new TextRun({ text, size, color: '111111', font: fontFamily })]
-      }
-      // match whole words only to avoid highlighting substrings (e.g., 'git' inside 'digital')
-      const pattern = new RegExp(
-        `(?<![A-Za-z0-9])(${keywordList.map(keywordToRegexPart).join('|')})(?![A-Za-z0-9])`,
-        'gi',
-      )
-      const raw = text
-        .split(pattern)
-        .filter((chunk) => chunk.length > 0)
-        .map((chunk) => ({ text: chunk, bold: keywordKeySet.has(normalizeHighlightKey(chunk)) }))
-
-      const merged = limitRepeatedHighlights(mergeHyphenatedHighlights(raw))
-      const once = merged.map((t) => {
-        if (!t.bold) return t
-        const key = normalizeHighlightKey(t.text)
-        if (!key || globalBoldSeen.has(key) || globalBoldCount >= GLOBAL_BOLD_MAX) return { ...t, bold: false }
-        globalBoldSeen.add(key)
-        globalBoldCount += 1
-        return t
-      })
-      return once.map((t) => new TextRun({ text: t.text, bold: t.bold, size, color: '111111', font: fontFamily }))
-    }
+    // Body text is never keyword-bolded. Bold is reserved for structural elements
+    // (candidate name, section headings, role titles), which set it explicitly.
+    const buildHighlightedRuns = (text: string, size = 21) => [
+      new TextRun({ text, size, color: '111111', font: fontFamily }),
+    ]
     const experienceLine = (
       left: string,
       right: string,
@@ -4084,12 +4241,29 @@ ${JSON.stringify(repairPayload)}`,
             // Add one blank line before the Skills section.
             new Paragraph({ text: '' }),
             sectionHeading(docxSectionLabels[resumeLanguage].skills),
-            new Paragraph({
-              // Skills should be plain (no keyword bolding).
-              children: [new TextRun({ text: displaySkills.join(' • '), size: 20, color: '111111', font: fontFamily })],
-              alignment: AlignmentType.LEFT,
-              spacing: { after: 140 },
-            }),
+            // One paragraph per skill category: the category label is bold, the skills themselves
+            // stay plain (no keyword bolding).
+            ...buildSkillLines(draftToSave).map(
+              (line, index, lines) =>
+                new Paragraph({
+                  children: [
+                    ...(line.label
+                      ? [
+                          new TextRun({
+                            text: `${line.label}: `,
+                            bold: true,
+                            size: 20,
+                            color: '111111',
+                            font: fontFamily,
+                          }),
+                        ]
+                      : []),
+                    new TextRun({ text: line.skills, size: 20, color: '111111', font: fontFamily }),
+                  ],
+                  alignment: AlignmentType.LEFT,
+                  spacing: { after: index === lines.length - 1 ? 140 : 40 },
+                }),
+            ),
             new Paragraph({ text: '', spacing: { after: 80 } }),
             sectionHeading(docxSectionLabels[resumeLanguage].experience),
             ...draftToSave.workHistory.flatMap((item) => [
@@ -4235,32 +4409,50 @@ ${JSON.stringify(repairPayload)}`,
     await jdWritable.write(new Blob([jobDescriptionTxtContent], { type: 'text/plain;charset=utf-8' }))
     await jdWritable.close()
 
-    return { folderName }
+    return {
+      folderName,
+      resumeDocxName,
+      resumePdfName,
+      coverLetterTxtName: 'coverletter.txt',
+      coverLetterPdfName: 'coverletter.pdf',
+      jobDescriptionTxtName,
+    }
   }
 
-  const handleDownloadResume = async () => {
+  const performDownload = async (job: {
+    draft: ResumeDraft
+    companyName: string
+    jobTitle: string
+    jobUrl: string
+    notes: string
+  }): Promise<{ ok: boolean; folderName?: string; files?: string[] }> => {
     // Require user to choose a download folder explicitly
     if (!downloadHandle) {
       toast.error('Please choose the folder which saves resume and cover letter')
-      return
+      return { ok: false }
     }
 
     const hasPermission = await ensureDirectoryReadWritePermission(downloadHandle)
     if (!hasPermission) {
       toast.error('Please allow write access to the selected folder, or choose the folder again.')
-      return
+      return { ok: false }
     }
 
+    setIsDownloading(true)
     try {
-      const { folderName } = await writeBundleToFolder(downloadHandle, {
-        draft,
-        companyName,
-        jobTitle,
-        jobUrl,
-        notes,
-      })
-      toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
-      return
+      // No success toast: completion is reported by the result dialog instead.
+      const result = await writeBundleToFolder(downloadHandle, job)
+      return {
+        ok: true,
+        folderName: result.folderName,
+        files: [
+          result.resumeDocxName,
+          result.resumePdfName,
+          result.coverLetterTxtName,
+          result.coverLetterPdfName,
+          result.jobDescriptionTxtName,
+        ],
+      }
     } catch (err) {
       console.error(err)
       const e = err as { name?: string; message?: string }
@@ -4274,13 +4466,13 @@ ${JSON.stringify(repairPayload)}`,
       // Immediately prompt to re-pick a folder and retry.
       try {
         const win = window as unknown as { showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle> }
-        if (!win || typeof win.showDirectoryPicker !== 'function') return
+        if (!win || typeof win.showDirectoryPicker !== 'function') return { ok: false }
 
         const dir = await win.showDirectoryPicker()
-        const hasPermission = await ensureDirectoryReadWritePermission(dir)
-        if (!hasPermission) {
+        const hasRetryPermission = await ensureDirectoryReadWritePermission(dir)
+        if (!hasRetryPermission) {
           toast.error('Folder permission denied. Please choose a folder again.')
-          return
+          return { ok: false }
         }
 
         await saveHandleToIDB(dir)
@@ -4288,20 +4480,40 @@ ${JSON.stringify(repairPayload)}`,
         const name = (dir as unknown as { name?: string }).name ?? null
         setDownloadHandleName(name)
 
-        const { folderName } = await writeBundleToFolder(dir, {
-          draft,
-          companyName,
-          jobTitle,
-          jobUrl,
-          notes,
-        })
-        toast.success(`Saved resume (DOCX/PDF) and cover letter (TXT/PDF) to ${folderName}`)
+        const retryResult = await writeBundleToFolder(dir, job)
+        return {
+          ok: true,
+          folderName: retryResult.folderName,
+          files: [
+            retryResult.resumeDocxName,
+            retryResult.resumePdfName,
+            retryResult.coverLetterTxtName,
+            retryResult.coverLetterPdfName,
+            retryResult.jobDescriptionTxtName,
+          ],
+        }
       } catch (retryErr) {
         console.error(retryErr)
         toast.error('Unable to write to the selected folder. Please choose the folder again.')
+        return { ok: false }
       }
-      return
+    } finally {
+      setIsDownloading(false)
     }
+  }
+
+  const handleDownloadResume = async () => {
+    const result = await performDownload({ draft, companyName, jobTitle, jobUrl, notes })
+    if (!result.ok || !result.folderName || !result.files) return
+
+    // Manual downloads report completion through the same dialog, not a toast.
+    setResultDialog({
+      companyName: companyName.trim(),
+      jobTitle: generalizeJobTitle(jobTitle, notes),
+      rootFolderName: downloadHandleName,
+      folderName: result.folderName,
+      files: result.files,
+    })
   }
 
   // cover-letter-specific handler removed: downloads now bundled with `handleDownloadResume`
@@ -4319,7 +4531,8 @@ ${JSON.stringify(repairPayload)}`,
           </div>
         </div>
         <p className="mt-3 text-xs text-slate-400">
-          Generate a resume DOCX and a cover letter TXT using your saved profile.
+          Generate a resume DOCX and a cover letter TXT using your saved profile. Clicking Generate will also save
+          the application and download the files to your chosen folder.
         </p>
       </div>
 
@@ -4369,13 +4582,23 @@ ${JSON.stringify(repairPayload)}`,
               <button
                 type="button"
                 onClick={handleGenerate}
-                disabled={isGenerating}
+                disabled={isGenerating || isSaving || isDownloading}
                 className="inline-flex items-center gap-2 rounded-full bg-indigo-500/80 px-4 py-2 text-xs font-semibold text-white transition hover:-translate-y-0.5 hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isGenerating ? (
                   <>
                     <LoadingSpinner label="Generating" />
                     Generating...
+                  </>
+                ) : isSaving ? (
+                  <>
+                    <LoadingSpinner label="Saving" />
+                    Saving...
+                  </>
+                ) : isDownloading ? (
+                  <>
+                    <LoadingSpinner label="Downloading" />
+                    Downloading...
                   </>
                 ) : (
                   <>
@@ -4386,7 +4609,7 @@ ${JSON.stringify(repairPayload)}`,
               <button
                 type="button"
                 onClick={handleReset}
-                disabled={isSaving}
+                disabled={isSaving || isGenerating || isDownloading}
                 className="inline-flex items-center gap-2 rounded-full border border-white/10 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200"
               >
                 <FiRefreshCw /> Reset
@@ -4677,32 +4900,62 @@ ${JSON.stringify(repairPayload)}`,
             <h2 className="text-base font-semibold text-white">Core skills</h2>
             <span className="text-xs text-slate-400">Add and manage skills</span>
           </div>
-          <p className="mt-1 text-xs text-slate-400">Add skills and remove them anytime.</p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {draft.skills.map((skill, index) => (
-              <div
-                key={`${skill}-${index}`}
-                className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/60 px-3 py-1.5 text-xs text-slate-100"
-              >
-                <span className="font-semibold">{skill}</span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateDraft((prev) => ({
-                      ...prev,
-                      skills: prev.skills.filter((_, idx) => idx !== index),
-                    }))
-                  }
-                  className="text-slate-400 transition hover:text-rose-300"
+          <p className="mt-1 text-xs text-slate-400">
+            Add skills and remove them anytime. Generated skills are grouped into categories, and the resume renders
+            one line per category.
+          </p>
+          {draft.skillCategories && draft.skillCategories.length > 0 ? (
+            <div className="mt-3 space-y-3">
+              {draft.skillCategories.map((entry) => (
+                <div key={entry.category}>
+                  <p className="text-xs font-semibold text-indigo-200">{entry.category}</p>
+                  <div className="mt-1.5 flex flex-wrap gap-2">
+                    {entry.skills.map((skill) => (
+                      <div
+                        key={`${entry.category}-${skill}`}
+                        className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/60 px-3 py-1.5 text-xs text-slate-100"
+                      >
+                        <span className="font-semibold">{skill}</span>
+                        <button
+                          type="button"
+                          onClick={() => updateDraft((prev) => removeSkillFromDraft(prev, skill))}
+                          className="text-slate-400 transition hover:text-rose-300"
+                        >
+                          <FiTrash2 />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {draft.skills.map((skill, index) => (
+                <div
+                  key={`${skill}-${index}`}
+                  className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/60 px-3 py-1.5 text-xs text-slate-100"
                 >
-                  <FiTrash2 />
-                </button>
-              </div>
-            ))}
-            {draft.skills.length === 0 && (
-              <span className="text-xs text-slate-400">No skills added yet.</span>
-            )}
-          </div>
+                  <span className="font-semibold">{skill}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateDraft((prev) => ({
+                        ...prev,
+                        skills: prev.skills.filter((_, idx) => idx !== index),
+                      }))
+                    }
+                    className="text-slate-400 transition hover:text-rose-300"
+                  >
+                    <FiTrash2 />
+                  </button>
+                </div>
+              ))}
+              {draft.skills.length === 0 && (
+                <span className="text-xs text-slate-400">No skills added yet.</span>
+              )}
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <input
               value={skillInput}
@@ -4710,29 +4963,31 @@ ${JSON.stringify(repairPayload)}`,
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
                   event.preventDefault()
-                  const nextSkill = skillInput.trim()
-                  if (!nextSkill) return
-                  updateDraft((prev) => ({
-                    ...prev,
-                    skills: [...prev.skills, nextSkill],
-                  }))
-                  setSkillInput('')
+                  handleAddSkill()
                 }
               }}
               placeholder="Add a skill"
               className="min-w-[200px] flex-1 rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none"
             />
+            {draft.skillCategories && draft.skillCategories.length > 0 && (
+              <select
+                value={resolvedSkillCategory}
+                onChange={(event) => setSkillCategoryInput(event.target.value)}
+                className="rounded-2xl border border-white/10 bg-slate-900/60 px-3 py-2 text-xs text-slate-100 focus:border-indigo-400 focus:outline-none"
+              >
+                {draft.skillCategories.map((entry) => (
+                  <option key={entry.category} value={entry.category}>
+                    {entry.category}
+                  </option>
+                ))}
+                {!draft.skillCategories.some((entry) => entry.category === OTHER_SKILL_CATEGORY) && (
+                  <option value={OTHER_SKILL_CATEGORY}>{OTHER_SKILL_CATEGORY}</option>
+                )}
+              </select>
+            )}
             <button
               type="button"
-              onClick={() => {
-                const nextSkill = skillInput.trim()
-                if (!nextSkill) return
-                updateDraft((prev) => ({
-                  ...prev,
-                  skills: [...prev.skills, nextSkill],
-                }))
-                setSkillInput('')
-              }}
+              onClick={handleAddSkill}
               className="inline-flex items-center gap-1 rounded-full border border-white/10 px-3 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-400 hover:text-white"
             >
               <FiPlus /> Add skill
@@ -4778,7 +5033,7 @@ ${JSON.stringify(repairPayload)}`,
                             return { ...prev, workHistory: next }
                           })
                         }
-                        placeholder="Add a key accomplishment here."
+                        placeholder="Add a real accomplishment, with numbers where you have them."
                         className="flex-1 bg-transparent px-2 py-1 text-xs text-slate-100 focus:outline-none"
                       />
                       <div className="flex items-center gap-1 text-slate-400">
@@ -4872,7 +5127,11 @@ ${JSON.stringify(repairPayload)}`,
 
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
           <h2 className="text-base font-semibold text-white">Key Achievements</h2>
-          <p className="mt-1 text-xs text-slate-400">One achievement per line.</p>
+          <p className="mt-1 text-xs text-slate-400">
+            One achievement per line. These lines, your work-history bullets, and Projects are the only source of real
+            numbers the generator can use — it will reuse them verbatim and never invent metrics, so the more real
+            numbers you add here, the more appear on the generated resume.
+          </p>
           <textarea
             value={(draft.keyAchievements ?? []).join('\n')}
             onChange={(event) =>
@@ -4924,10 +5183,13 @@ ${JSON.stringify(repairPayload)}`,
         </section>
 
         <section className="flex flex-wrap items-center gap-3 lg:col-span-2">
+          <p className="w-full text-xs text-slate-400">
+            Generate already saves and downloads automatically. Use these only to retry a step manually.
+          </p>
           <button
             type="button"
             onClick={handleSave}
-            disabled={isSaving || isSaved || !hasGenerated}
+            disabled={isSaving || isSaved || !hasGenerated || isGenerating || isDownloading}
             className="inline-flex items-center gap-2 rounded-full bg-emerald-500/80 px-5 py-2 text-xs font-semibold text-white transition hover:-translate-y-0.5 hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isSaving ? (
@@ -4948,14 +5210,88 @@ ${JSON.stringify(repairPayload)}`,
           <button
             type="button"
             onClick={handleDownloadResume}
-            disabled={!isSaved || isSaving}
+            disabled={!isSaved || isSaving || isDownloading || isGenerating}
             className="inline-flex items-center gap-2 rounded-full border border-white/10 px-5 py-2 text-xs font-semibold text-slate-200 transition hover:border-indigo-400 hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <FiDownload /> Download
+            {isDownloading ? (
+              <>
+                <LoadingSpinner label="Downloading" />
+                Downloading...
+              </>
+            ) : (
+              <>
+                <FiDownload /> Download
+              </>
+            )}
           </button>
           {/* cover letter download removed - unified into single Download button */}
         </section>
       </div>
+
+      {resultDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-slate-950/95 p-6 shadow-soft">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/40">
+                  <FiCheckCircle className="text-lg" />
+                </div>
+                <div>
+                  <h2 className="text-base font-semibold text-white">Resume generated, saved & downloaded</h2>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {resultDialog.jobTitle}
+                    {resultDialog.companyName ? ` · ${resultDialog.companyName}` : ''}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setResultDialog(null)}
+                className="text-slate-400 transition hover:text-white"
+                aria-label="Close"
+              >
+                <FiX />
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-white/10 bg-slate-900/60 p-4">
+              <p className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+                <FiFolder /> Saved to
+              </p>
+              <p className="mt-1 break-all text-sm text-slate-100">
+                {resultDialog.rootFolderName
+                  ? `${resultDialog.rootFolderName}/${resultDialog.folderName}`
+                  : resultDialog.folderName}
+              </p>
+            </div>
+
+            <div className="mt-3">
+              <p className="text-xs font-semibold text-slate-300">Files</p>
+              <ul className="mt-2 space-y-1">
+                {resultDialog.files.map((file) => (
+                  <li
+                    key={file}
+                    className="flex items-center gap-2 rounded-xl border border-white/5 bg-slate-900/40 px-3 py-2 text-xs text-slate-200"
+                  >
+                    <FiFileText className="text-slate-400" />
+                    <span className="truncate">{file}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setResultDialog(null)}
+                className="inline-flex items-center gap-2 rounded-full bg-indigo-500/80 px-4 py-2 text-xs font-semibold text-white transition hover:-translate-y-0.5 hover:bg-indigo-500"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
