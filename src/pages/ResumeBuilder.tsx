@@ -229,17 +229,23 @@ const generalizeJobTitle = (rawTitle: string, jobDescription: string) => {
 
   // If title is very generic, refine from JD signals.
   const lowerTitle = cleaned.toLowerCase()
-  const isGenericSE =
-    /\bsoftware engineer\b/.test(lowerTitle) ||
-    /\bengineer\b/.test(lowerTitle) ||
-    /\bdeveloper\b/.test(lowerTitle)
+  // Only a title that carries no domain of its own may be re-inferred from the JD.
+  // "Security Engineer" or "QA Engineer" already name their role, and rewriting them
+  // from keyword counts is how a resume ends up aimed at the wrong job.
+  const withoutSeniority = lowerTitle
+    .replace(/\b(intern|junior|jr\.?|mid|mid-level|senior|sr\.?|staff|principal|lead)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const isGenericSE = /^(?:software\s+)?(?:engineer|developer|programmer|engineering)$/.test(withoutSeniority)
 
   const score = (patterns: RegExp[]) => patterns.reduce((acc, r) => acc + (r.test(jd) ? 1 : 0), 0)
-  const frontScore = score([/\breact\b/, /\btypescript\b/, /\bfrontend\b/, /\bcss\b/, /\bnext\.js\b/, /\btailwind\b/, /\bui\b/])
+  // Terms that appear in almost any engineering JD regardless of role (ui, model,
+  // training, bare "ml") are deliberately excluded: they only add noise to the counts.
+  const frontScore = score([/\breact\b/, /\btypescript\b/, /\bfrontend\b/, /\bcss\b/, /\bnext\.js\b/, /\btailwind\b/])
   const backScore = score([/\bbackend\b/, /\bapi\b/, /\brest\b/, /\bgraphql\b/, /\bpostgres\b/, /\bmysql\b/, /\bredis\b/, /\bnode\.js\b/, /\bpython\b/, /\bjava\b/])
   const dataScore = score([/\bdata engineer\b/, /\betl\b/, /\bspark\b/, /\bwarehouse\b/, /\bairflow\b/, /\bdbt\b/])
   const devopsScore = score([/\bdevops\b/, /\bsre\b/, /\bkubernetes\b/, /\bdocker\b/, /\bterraform\b/, /\bci\/cd\b/])
-  const mlScore = score([/\bmachine learning\b/, /\bml\b/, /\bmodel\b/, /\bllm\b/, /\btraining\b/])
+  const mlScore = score([/\bmachine learning\b/, /\bllm\b/, /\bpytorch\b/, /\btensorflow\b/, /\bmodel training\b/])
 
   const preserveSeniority = () => {
     const m = cleaned.match(/\b(intern|junior|jr\.|mid|senior|sr\.|staff|principal|lead|manager|director|vp|head)\b/i)
@@ -250,13 +256,18 @@ const generalizeJobTitle = (rawTitle: string, jobDescription: string) => {
   const pick = (role: string) => (seniority ? `${seniority} ${role}`.replace(/\s+/g, ' ').trim() : role)
 
   let inferred: string | null = null
-  if (isGenericSE && (frontScore || backScore || dataScore || devopsScore || mlScore)) {
-    const max = Math.max(frontScore, backScore, dataScore, devopsScore, mlScore)
-    if (max === dataScore) inferred = pick('Data Engineer')
-    else if (max === devopsScore) inferred = pick('DevOps Engineer')
-    else if (max === mlScore) inferred = pick('Machine Learning Engineer')
-    else if (max === frontScore) inferred = pick('Frontend Engineer')
-    else if (max === backScore) inferred = pick('Backend Engineer')
+  if (isGenericSE) {
+    // Rank instead of Math.max: the old else-if chain broke ties by source order, so a
+    // 1-vs-1 coincidence silently picked a role. Require a clear win before rewriting.
+    const ranked = [
+      { role: 'Frontend Engineer', value: frontScore },
+      { role: 'Backend Engineer', value: backScore },
+      { role: 'Data Engineer', value: dataScore },
+      { role: 'DevOps Engineer', value: devopsScore },
+      { role: 'Machine Learning Engineer', value: mlScore },
+    ].sort((a, b) => b.value - a.value)
+    const [top, runnerUp] = ranked
+    if (top.value >= 2 && top.value > runnerUp.value) inferred = pick(top.role)
   }
 
   // Apply specialization prefix if we captured one (and didn’t infer a more specific role).
