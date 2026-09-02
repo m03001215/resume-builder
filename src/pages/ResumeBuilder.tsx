@@ -176,6 +176,13 @@ const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
   },
 }
 
+// Newer OpenAI models (GPT-5 family and the o-series reasoning models) reject any
+// temperature other than the default of 1, so the parameter is omitted for them.
+const modelSupportsTemperature = (model: string) => !/^(?:o[1-9]|gpt-5)/i.test(model.trim())
+
+const temperatureParam = (model: string, temperature: number) =>
+  modelSupportsTemperature(model) ? { temperature } : {}
+
 const getResumeContactEmail = (profile: ReturnType<typeof useAuth>['profile']) => {
   const v = (profile?.resume_email ?? '').toString().trim()
   if (v) return v
@@ -2174,7 +2181,7 @@ export default function ResumeBuilder() {
         },
         body: JSON.stringify({
           model,
-          temperature: 0.3,
+          ...temperatureParam(model, 0.3),
           messages: [
             {
               role: 'system',
@@ -2792,7 +2799,7 @@ A: <answer>
         },
         body: JSON.stringify({
           model,
-          temperature: 0.4,
+          ...temperatureParam(model, 0.4),
           messages: [
             {
               role: 'system',
@@ -2989,7 +2996,7 @@ If you understand, return the single JSON object now.`,
           },
           body: JSON.stringify({
             model,
-            temperature: 0.2,
+            ...temperatureParam(model, 0.2),
             messages: [
               {
                 role: 'system',
@@ -3072,7 +3079,7 @@ ${JSON.stringify(repairPayload)}`,
           },
           body: JSON.stringify({
             model,
-            temperature: 0.2,
+            ...temperatureParam(model, 0.2),
             messages: [
               {
                 role: 'system',
@@ -3159,7 +3166,7 @@ ${JSON.stringify(repairPayload)}`,
           },
           body: JSON.stringify({
             model,
-            temperature: 0.3,
+            ...temperatureParam(model, 0.3),
             messages: [
               {
                 role: 'system',
@@ -3292,7 +3299,7 @@ ${JSON.stringify(repairPayload)}`,
       },
       body: JSON.stringify({
         model,
-        temperature: 0.4,
+        ...temperatureParam(model, 0.4),
         messages: [
           {
             role: 'system',
@@ -3482,7 +3489,7 @@ If you understand, return the single JSON object now.`,
         },
         body: JSON.stringify({
           model,
-          temperature: 0.2,
+          ...temperatureParam(model, 0.2),
           messages: [
             {
               role: 'system',
@@ -3564,7 +3571,7 @@ ${JSON.stringify(repairPayload)}`,
         },
         body: JSON.stringify({
           model,
-          temperature: 0.2,
+          ...temperatureParam(model, 0.2),
           messages: [
             {
               role: 'system',
@@ -3647,7 +3654,7 @@ ${JSON.stringify(repairPayload)}`,
         },
         body: JSON.stringify({
           model,
-          temperature: 0.3,
+          ...temperatureParam(model, 0.3),
           messages: [
             {
               role: 'system',
