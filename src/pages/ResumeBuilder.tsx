@@ -30,7 +30,12 @@ import LoadingSpinner from '../components/LoadingSpinner'
 import toast from 'react-hot-toast'
 import { supabase } from '../lib/supabaseClient'
 
-type ResumeLanguage = 'English' | 'Japanese' | 'Chinese'
+type ResumeLanguage = 'English' | 'Japanese' | 'Chinese' | 'Spanish'
+
+// CJK scripts have no glyphs in jsPDF's built-in fonts, so those languages are drawn to a
+// canvas and embedded as an image. Latin-script languages keep the native-font path, whose
+// text stays selectable (and therefore ATS-readable).
+const needsRasterizedPdf = (language: ResumeLanguage) => language === 'Japanese' || language === 'Chinese'
 
 type ResumeStyle = 'Classic' | 'Modern' | 'Minimal' | 'Executive' | 'Creative' | 'TrueCircle' | 'Wide'
 
@@ -49,8 +54,14 @@ type ResumeStylePreset = {
   docxMarginTwipsY?: number
   docxPageSizeTwips?: { width: number; height: number }
   accentHex: string // 6-char hex without '#'
+  // 'boxed' (white text on an accent fill) is deliberately unused by every preset: if an ATS
+  // strips shading it leaves white-on-white, and white text trips keyword-stuffing heuristics.
   headingStyle: 'underline' | 'bar' | 'shaded' | 'boxed' | 'none'
-  headingUppercase: boolean
+  headingCase: 'upper' | 'title'
+  // Whether the name / role line pick up the accent colour. Applied by BOTH the PDF and DOCX
+  // renderers so a style looks the same in either file.
+  headerNameUsesAccent: boolean
+  headerTitleUsesAccent: boolean
   dividerStyle: 'thick' | 'thin' | 'none'
   bulletChar: string
   pdf: {
@@ -73,108 +84,139 @@ type JobListItem = {
   folderName?: string
 }
 
+// Every preset stays inside the same ATS envelope: US Letter, one column, standard base
+// fonts, standard section labels, black body text, and a plain bullet. What varies is
+// everything a parser does not read -- typeface, alignment, heading treatment, rules,
+// colour and density -- so the seven look clearly different without costing a score.
 const RESUME_STYLE_PRESETS: Record<ResumeStyle, ResumeStylePreset> = {
   Classic: {
     label: 'Classic',
-    description: 'Centered header + clean underlined sections.',
+    description: 'Traditional serif, centered header, thick rule, uppercase underlined headings.',
     headerAlign: 'center',
     fontFamily: 'Times New Roman',
     pdfFontFamily: 'times',
     accentHex: '1f4e79',
     headingStyle: 'underline',
-    headingUppercase: true,
+    headingCase: 'upper',
+    headerNameUsesAccent: false,
+    headerTitleUsesAccent: false,
     dividerStyle: 'thick',
     bulletChar: '•',
-    pdf: { nameSize: 19, titleSize: 11.5, contactSize: 10, headingSize: 10.5, bodySize: 10.5 },
+    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 10, headingSize: 11, bodySize: 10.5 },
   },
   Modern: {
     label: 'Modern',
-    description: 'Left-aligned header + clean underlined section lines.',
+    description: 'Sans-serif, left header in teal, accent bar beside each heading, no rules.',
     headerAlign: 'left',
     fontFamily: 'Calibri',
     pdfFontFamily: 'helvetica',
     accentHex: '0f766e',
-    headingStyle: 'underline',
-    headingUppercase: true,
-    dividerStyle: 'thin',
-    bulletChar: '–',
-    pdf: { nameSize: 20, titleSize: 11, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+    headingStyle: 'bar',
+    headingCase: 'upper',
+    headerNameUsesAccent: true,
+    headerTitleUsesAccent: true,
+    dividerStyle: 'none',
+    bulletChar: '•',
+    pdf: { nameSize: 21, titleSize: 11, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
   },
   Minimal: {
     label: 'Minimal',
-    description: 'Whitespace-first + subtle underlined section lines.',
+    description: 'Quiet and airy: no rules at all, title-case headings, pure black, wide margins.',
     headerAlign: 'left',
     fontFamily: 'Segoe UI',
-    pdfFontFamily: 'courier',
+    pdfFontFamily: 'helvetica',
+    pdfMarginPtX: 66,
+    pdfMarginPtY: 60,
+    docxMarginTwipsX: 1320,
+    docxMarginTwipsY: 1200,
     accentHex: '111111',
-    headingStyle: 'underline',
-    headingUppercase: true,
+    headingStyle: 'none',
+    headingCase: 'title',
+    headerNameUsesAccent: false,
+    headerTitleUsesAccent: false,
     dividerStyle: 'none',
-    bulletChar: '•',
-    pdf: { nameSize: 18, titleSize: 10.5, contactSize: 9.5, headingSize: 10, bodySize: 10.5 },
+    bulletChar: '–',
+    pdf: { nameSize: 17, titleSize: 10.5, contactSize: 9, headingSize: 10.5, bodySize: 10 },
   },
   Executive: {
     label: 'Executive',
-    description: 'ATS-friendly: left header + clean underlined headings.',
-    headerAlign: 'left',
+    description: 'Formal and dense: large centered serif name, grey heading bands, tight margins.',
+    headerAlign: 'center',
     fontFamily: 'Georgia',
     pdfFontFamily: 'times',
-    accentHex: '7c3aed',
-    headingStyle: 'underline',
-    headingUppercase: true,
-    dividerStyle: 'thin',
+    pdfMarginPtX: 48,
+    pdfMarginPtY: 54,
+    docxMarginTwipsX: 960,
+    docxMarginTwipsY: 1080,
+    accentHex: '1f2937',
+    headingStyle: 'shaded',
+    headingCase: 'upper',
+    headerNameUsesAccent: false,
+    headerTitleUsesAccent: false,
+    dividerStyle: 'thick',
     bulletChar: '•',
-    pdf: { nameSize: 21, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+    pdf: { nameSize: 23, titleSize: 12, contactSize: 9.5, headingSize: 11, bodySize: 10.5 },
   },
   Creative: {
     label: 'Creative',
-    description: 'High-contrast accent + underlined section lines.',
+    description: 'Bold orange name, centered, large title-case headings over a thin rule.',
     headerAlign: 'center',
     fontFamily: 'Trebuchet MS',
     pdfFontFamily: 'helvetica',
-    accentHex: 'f97316',
+    accentHex: 'ea580c',
     headingStyle: 'underline',
-    headingUppercase: true,
+    headingCase: 'title',
+    headerNameUsesAccent: true,
+    headerTitleUsesAccent: false,
     dividerStyle: 'thin',
-    // jsPDF built-in fonts may not support glyphs like ◆; use a safe bullet.
     bulletChar: '•',
-    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 10, headingSize: 10.5, bodySize: 10.5 },
+    pdf: { nameSize: 22, titleSize: 12, contactSize: 10, headingSize: 12.5, bodySize: 10.5 },
   },
   TrueCircle: {
     label: 'TrueCircle',
-    description: 'ATS-friendly: crisp underlines + calm accent.',
+    description: 'Serif with a blue accent bar beside each heading and a thin header rule.',
     headerAlign: 'left',
     fontFamily: 'Cambria',
     pdfFontFamily: 'times',
     accentHex: '2563eb',
-    headingStyle: 'underline',
-    headingUppercase: true,
+    headingStyle: 'bar',
+    headingCase: 'upper',
+    headerNameUsesAccent: true,
+    headerTitleUsesAccent: false,
     dividerStyle: 'thin',
     bulletChar: '•',
-    pdf: { nameSize: 20, titleSize: 11.5, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
+    pdf: { nameSize: 19, titleSize: 11, contactSize: 9.5, headingSize: 10.5, bodySize: 10.5 },
   },
   Wide: {
     label: 'Wide',
-    description: 'More horizontal space + larger fonts (ATS-friendly).',
+    description: 'Widest text column and the largest body type — fewer pages, easier to read.',
     headerAlign: 'left',
     fontFamily: 'Open Sans',
     pdfFontFamily: 'helvetica',
-    // Use standard Letter sizing so the PDF doesn't open "tiny" by default in viewers.
-    // (Many viewers auto-fit large pages like Tabloid, making text appear small.)
-    // Comfortable margins (more space before name, larger left/right margins).
-    // Smaller left/right, more top/bottom padding.
-    pdfMarginPtX: 42,
+    // Narrow side margins widen the text column; Letter page size is kept so viewers and
+    // parsers do not have to rescale.
+    pdfMarginPtX: 40,
     pdfMarginPtY: 54,
-    docxMarginTwipsX: 840,
+    docxMarginTwipsX: 800,
     docxMarginTwipsY: 1080,
-    accentHex: '0ea5e9',
+    accentHex: '0369a1',
     headingStyle: 'underline',
-    headingUppercase: true,
-    dividerStyle: 'thin',
+    headingCase: 'upper',
+    headerNameUsesAccent: false,
+    headerTitleUsesAccent: false,
+    dividerStyle: 'none',
     bulletChar: '•',
     pdf: { nameSize: 22, titleSize: 12.5, contactSize: 10.5, headingSize: 11.5, bodySize: 11.5 },
   },
 }
+
+// Section labels are stored uppercase, so title case has to be rebuilt rather than skipped.
+// Scripts without letter case (Japanese, Chinese) are unaffected by either branch.
+const toHeadingTitleCase = (value: string) =>
+  value.replace(/\S+/g, (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+
+const formatSectionHeading = (label: string, preset: ResumeStylePreset) =>
+  preset.headingCase === 'title' ? toHeadingTitleCase(label) : label.toUpperCase()
 
 // Newer OpenAI models (GPT-5 family and the o-series reasoning models) reject any
 // temperature other than the default of 1, so the parameter is omitted for them.
@@ -346,13 +388,17 @@ const formatMonth = (value?: string | null) => {
   return value
 }
 
-const monthToLabel = (value?: string) => {
+const monthToLabel = (value?: string, language: ResumeLanguage = 'English') => {
   if (!value) return ''
   const [year, month] = value.split('-')
   if (!year || !month) return value
   const date = new Date(Number(year), Number(month) - 1)
-  return date.toLocaleString('en-US', { month: 'short', year: 'numeric' })
+  // Japanese/Chinese resumes have always shown English month labels; only Spanish opts out.
+  const locale = language === 'Spanish' ? 'es-ES' : 'en-US'
+  return date.toLocaleString(locale, { month: 'short', year: 'numeric' })
 }
+
+const presentLabel = (language: ResumeLanguage = 'English') => (language === 'Spanish' ? 'Presente' : 'Present')
 
 const workModeLabel = (value?: WorkHistoryItem['workMode'], language: ResumeLanguage = 'English') => {
   if (!value) return ''
@@ -360,6 +406,7 @@ const workModeLabel = (value?: WorkHistoryItem['workMode'], language: ResumeLang
     English: { remote: 'Remote', hybrid: 'Hybrid', onsite: 'Onsite' },
     Japanese: { remote: 'リモート', hybrid: 'ハイブリッド', onsite: 'オンサイト' },
     Chinese: { remote: '远程', hybrid: '混合', onsite: '现场' },
+    Spanish: { remote: 'Remoto', hybrid: 'Híbrido', onsite: 'Presencial' },
   }
   switch (value) {
     case 'remote':
@@ -387,6 +434,9 @@ const buildCoverLetter = (
   }
   if (language === 'Chinese') {
     return `您好，招聘团队：\n\n我是${fullName}，目前在${city}工作，担任${headline}。我很高兴向您提交我的简历以供审阅。过往经历中，我专注于交付可衡量的业务成果，与跨职能团队紧密协作，并通过工程实践提升性能、稳定性与交付效率。\n\n期待有机会在贵公司贡献我的经验与能力。感谢您的时间与考虑。\n\n此致\n敬礼\n${fullName}`
+  }
+  if (language === 'Spanish') {
+    return `Estimado equipo de selección:\n\nMe llamo ${fullName} y trabajo como ${headline} en ${city}. Me complace compartir mi currículum para su consideración. A lo largo de mi trayectoria me he centrado en entregar resultados medibles, colaborar con equipos multidisciplinarios y desarrollar soluciones que generan impacto.\n\nMe entusiasma la posibilidad de aportar mi experiencia a su organización. Gracias por su tiempo y consideración.\n\nAtentamente,\n${fullName}`
   }
   return `Hello Hiring Team,\n\nI’m ${fullName}, a ${headline} based in ${city}. I’m excited to share my resume for your review. My background includes delivering measurable results, collaborating across teams, and building solutions that drive impact.\n\nI’d love the opportunity to contribute to your organization. Thank you for your time and consideration.\n\nSincerely,\n${fullName}`
 }
@@ -828,6 +878,15 @@ const SECTION_LABELS: Record<
     projects: '项目',
     coverLetter: '求职信',
   },
+  Spanish: {
+    summary: 'PERFIL PROFESIONAL',
+    skills: 'HABILIDADES',
+    experience: 'EXPERIENCIA',
+    education: 'EDUCACIÓN',
+    achievements: 'LOGROS CLAVE',
+    projects: 'PROYECTOS',
+    coverLetter: 'CARTA DE PRESENTACIÓN',
+  },
 }
 
 const getCanvasFontStack = (language: ResumeLanguage, preferred?: string) => {
@@ -1019,7 +1078,7 @@ const buildResumePdfBlobRasterized = (args: {
   }
 
   const drawSectionHeading = (label: string) => {
-    const text = preset.headingUppercase ? label.toUpperCase() : label
+    const text = formatSectionHeading(label, preset)
     y += Math.round(10 * scale)
     ensureSpace(Math.round(18 * scale))
     setFont(preset.pdf.headingSize, true)
@@ -1181,7 +1240,7 @@ const buildResumePdfBlobRasterized = (args: {
 
   drawSectionHeading(SECTION_LABELS[language].experience)
   for (const item of draft.workHistory) {
-    const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
+    const dates = `${monthToLabel(item.start, language)} - ${item.end === 'Present' ? presentLabel(language) : monthToLabel(item.end, language)}`
     const locMode = [item.location, workModeLabel(item.workMode, language)].filter(Boolean).join(' | ')
 
     ensureSpace(Math.round(16 * scale))
@@ -1233,7 +1292,7 @@ const buildResumePdfBlobRasterized = (args: {
     const degree = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
     const meta = [
       [edu.school, edu.location].filter(Boolean).join(' | '),
-      `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+      `${monthToLabel(edu.start, language)} - ${edu.end === 'Present' ? presentLabel(language) : monthToLabel(edu.end, language)}`,
     ]
       .filter(Boolean)
       .join(' | ')
@@ -1256,7 +1315,7 @@ const buildResumePdfBlobDocxStyle = (args: {
 }) => {
   const { profile, draft, jobTitle, language, style } = args
   const preset = getResumeStylePreset(style)
-  if (language !== 'English') {
+  if (needsRasterizedPdf(language)) {
     return buildResumePdfBlobRasterized({ profile, draft, jobTitle, language, style })
   }
 
@@ -1396,7 +1455,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     y = ensureSpace(y + 10, 18) // before: 10pt
     pdf.setFont(pdfFontFamily, 'bold')
     pdf.setFontSize(preset.pdf.headingSize)
-    const text = preset.headingUppercase ? label.toUpperCase() : label
+    const text = formatSectionHeading(label, preset)
 
     if (preset.headingStyle === 'shaded') {
       const fill = { r: 238, g: 238, b: 238 }
@@ -1507,9 +1566,10 @@ const buildResumePdfBlobDocxStyle = (args: {
 
   // --- Render (mirrors DOCX order/labels) ---
   let y = marginY
-  y = drawHeaderWrapped(fullName, y, preset.pdf.nameSize, true, '111111')
+  y = drawHeaderWrapped(fullName, y, preset.pdf.nameSize, true, preset.headerNameUsesAccent ? preset.accentHex : '111111')
   y += 2
-  if (titleLine) y = drawHeaderWrapped(titleLine, y, preset.pdf.titleSize, true, '333333')
+  if (titleLine)
+    y = drawHeaderWrapped(titleLine, y, preset.pdf.titleSize, true, preset.headerTitleUsesAccent ? preset.accentHex : '333333')
   if (locationLine) y = drawHeaderWrapped(locationLine, y, preset.pdf.contactSize, false, '555555')
   if (contactLine) y = drawHeaderWrapped(contactLine, y, preset.pdf.contactSize, false, '555555')
   y = drawDivider(y)
@@ -1558,7 +1618,7 @@ const buildResumePdfBlobDocxStyle = (args: {
   y = drawSectionHeading(SECTION_LABELS[language].experience, y)
   for (const item of draft.workHistory) {
     const titleForResume = item.resume_title
-    const dates = `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`
+    const dates = `${monthToLabel(item.start, language)} - ${item.end === 'Present' ? presentLabel(language) : monthToLabel(item.end, language)}`
     const locMode = [item.location, workModeLabel(item.workMode, language)].filter(Boolean).join(' | ')
 
     y = drawExperienceLine({
@@ -1595,7 +1655,7 @@ const buildResumePdfBlobDocxStyle = (args: {
     const degree = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
     const meta = [
       [edu.school, edu.location].filter(Boolean).join(' | '),
-      `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+      `${monthToLabel(edu.start, language)} - ${edu.end === 'Present' ? presentLabel(language) : monthToLabel(edu.end, language)}`,
     ]
       .filter(Boolean)
       .join(' | ')
@@ -1653,7 +1713,7 @@ const buildCoverLetterPdfBlob = (args: {
   const { profile, draft, language } = args
   const fullName = buildCandidateFullName(profile) || 'Candidate'
 
-  if (language !== 'English') {
+  if (needsRasterizedPdf(language)) {
     // Rasterized cover letter PDF for CJK (Unicode-safe)
     const pdf = new jsPDF({ unit: 'pt', format: 'letter' })
     const pageWidthPt = pdf.internal.pageSize.getWidth()
@@ -1771,10 +1831,17 @@ const buildCoverLetterPdfBlob = (args: {
     return margin
   }
 
+  // Only Latin-script languages reach this branch; CJK returned from the rasterized path above.
+  const coverLetterHeading = language === 'Spanish' ? 'Carta de Presentación' : 'Cover Letter'
+  const emptyCoverLetterText =
+    language === 'Spanish'
+      ? 'No se generó el texto de la carta de presentación.'
+      : 'No cover letter text was generated.'
+
   let y = margin
   pdf.setFont('helvetica', 'bold')
   pdf.setFontSize(16)
-  pdf.text(`${fullName} — Cover Letter`, margin, y)
+  pdf.text(`${fullName} — ${coverLetterHeading}`, margin, y)
   y += 22
 
   pdf.setFont('helvetica', 'normal')
@@ -1783,7 +1850,7 @@ const buildCoverLetterPdfBlob = (args: {
   const body = (draft.coverLetter || '').trim()
   const paragraphs = body.length > 0 ? body.split(/\n{2,}/g) : []
   if (paragraphs.length === 0) {
-    const wrapped = pdf.splitTextToSize('No cover letter text was generated.', maxWidth) as string[]
+    const wrapped = pdf.splitTextToSize(emptyCoverLetterText, maxWidth) as string[]
     for (const line of wrapped) {
       y = ensureSpace(y, 16)
       pdf.text(line, margin, y)
@@ -1844,7 +1911,7 @@ export default function ResumeBuilder() {
   const [resumeLanguage, setResumeLanguage] = useState<ResumeLanguage>(() => {
     try {
       const saved = localStorage.getItem('resume_generator_language')
-      if (saved === 'English' || saved === 'Japanese' || saved === 'Chinese') return saved
+      if (saved === 'English' || saved === 'Japanese' || saved === 'Chinese' || saved === 'Spanish') return saved
     } catch {
       // ignore
     }
@@ -1868,6 +1935,23 @@ export default function ResumeBuilder() {
       // ignore
     }
     return 'Classic'
+  })
+  // Section toggles, off unless the user has explicitly opted in. These control what the
+  // generator is asked for and what the exported files contain; they never delete what you
+  // have typed into the draft, so turning a section back on restores it untouched.
+  const [includeKeyAchievements, setIncludeKeyAchievements] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('resume_generator_include_achievements') === 'true'
+    } catch {
+      return false
+    }
+  })
+  const [includeProjects, setIncludeProjects] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('resume_generator_include_projects') === 'true'
+    } catch {
+      return false
+    }
   })
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
@@ -1911,6 +1995,30 @@ export default function ResumeBuilder() {
       // ignore
     }
   }, [resumeStyle])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('resume_generator_include_achievements', String(includeKeyAchievements))
+    } catch {
+      // ignore
+    }
+  }, [includeKeyAchievements])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('resume_generator_include_projects', String(includeProjects))
+    } catch {
+      // ignore
+    }
+  }, [includeProjects])
+
+  // Single choke point for output: every renderer already skips a section whose array
+  // is empty, so clearing them here omits the section from DOCX and both PDF paths.
+  const applySectionToggles = (source: ResumeDraft): ResumeDraft => ({
+    ...source,
+    keyAchievements: includeKeyAchievements ? source.keyAchievements : [],
+    projects: includeProjects ? source.projects : [],
+  })
 
   // (ATS Print-to-PDF export removed; reverted to previous behavior.)
 
@@ -2840,14 +2948,22 @@ INSTRUCTIONS:
    - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
    - Every returned workHistory entry MUST include a non-empty resumeTitle string.
 0.4 Key Achievements + Projects (required):
-   - keyAchievements MUST be a non-empty array with 5–6 items.
-   - Every keyAchievements item SHOULD include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.), taken from the candidate's real metrics per section 0.5.
-   - projects MUST be an array with EXACTLY 3 items.
+${
+  includeKeyAchievements
+    ? `   - keyAchievements MUST be a non-empty array with 5–6 items.
+   - Every keyAchievements item SHOULD include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.), taken from the candidate's real metrics per section 0.5.`
+    : `   - keyAchievements MUST be an empty array []. The candidate has excluded this section; do not write any achievements. Any real metrics from existingKeyAchievements still belong in the role bullets where they fit.`
+}
+${
+  includeProjects
+    ? `   - projects MUST be an array with EXACTLY 3 items.
    - Each project must be extremely relevant to the job description.
    - Each project item must be ONE sentence and must include ALL of:
      a) a real user story (explicitly name the user persona and goal),
      b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
-     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
+     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).`
+    : `   - projects MUST be an empty array []. The candidate has excluded this section; do not write any projects. Any real metrics from existingProjects still belong in the role bullets where they fit.`
+}
    - Each item must be action/outcome oriented and aligned to the target role/JD.
    - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
 0.5 Real metrics (required, strict):
@@ -3143,8 +3259,10 @@ ${JSON.stringify(repairPayload)}`,
         const metricBackedAchievementCount = existingAchievements.filter((a: string) =>
           hasMeasurableImpact(a),
         ).length
-        const needsAchievements = existingAchievements.length < 5
-        const needsProjects = existingProjects.length === 0
+        // An excluded section is never topped up: that would spend a whole extra call
+        // generating content the export is about to drop.
+        const needsAchievements = includeKeyAchievements && existingAchievements.length < 5
+        const needsProjects = includeProjects && existingProjects.length === 0
         if (!needsAchievements && !needsProjects) return draftParsed
 
         const repairPayload = {
@@ -3631,8 +3749,9 @@ ${JSON.stringify(repairPayload)}`,
       const metricBackedAchievementCount = existingAchievements.filter((a: string) =>
         hasMeasurableImpact(a),
       ).length
-      const needsAchievements = existingAchievements.length < 5
-      const needsProjects = existingProjects.length === 0
+      // An excluded section is never topped up — see the note in the single-generation copy.
+      const needsAchievements = includeKeyAchievements && existingAchievements.length < 5
+      const needsProjects = includeProjects && existingProjects.length === 0
       if (!needsAchievements && !needsProjects) return draftParsed
 
       const repairPayload = {
@@ -3961,7 +4080,9 @@ ${JSON.stringify(repairPayload)}`,
     baseDir: FileSystemDirectoryHandle,
     job: { draft: ResumeDraft; companyName: string; jobTitle: string; notes: string; jobUrl: string },
   ) => {
-    const { draft: draftToSave, companyName: companyNameToSave, jobTitle: jobTitleToSave, notes: notesToSave, jobUrl: jobUrlToSave } = job
+    const { draft: rawDraftToSave, companyName: companyNameToSave, jobTitle: jobTitleToSave, notes: notesToSave, jobUrl: jobUrlToSave } = job
+    // Excluded sections are dropped here so DOCX and both PDF renderers stay in sync.
+    const draftToSave = applySectionToggles(rawDraftToSave)
 
     const fullName = buildCandidateFullName(profile)
     const titleLine = (draftToSave.targetTitle || jobTitleToSave || '').trim()
@@ -3976,11 +4097,11 @@ ${JSON.stringify(repairPayload)}`,
     const contentWidthTwips = pageWidthTwips - docxMarginTwipsX * 2
     const rightTabStop = contentWidthTwips - experienceRightIndent
     const fontFamily = preset.fontFamily
-    const headingText = (value: string) => (preset.headingUppercase ? value.toUpperCase() : value)
+    const headingText = (value: string) => formatSectionHeading(value, preset)
     const headerAlignment = preset.headerAlign === 'center' ? AlignmentType.CENTER : AlignmentType.LEFT
-    const headerNameColor =
-      resumeStyle === 'Modern' || resumeStyle === 'Creative' || resumeStyle === 'TrueCircle' ? preset.accentHex : '111111'
-    const headerTitleColor = resumeStyle === 'Modern' || resumeStyle === 'TrueCircle' ? preset.accentHex : '333333'
+    // Driven by the preset (not a style-name list) so the DOCX and the PDF agree.
+    const headerNameColor = preset.headerNameUsesAccent ? preset.accentHex : '111111'
+    const headerTitleColor = preset.headerTitleUsesAccent ? preset.accentHex : '333333'
     // Body text is never keyword-bolded. Bold is reserved for structural elements
     // (candidate name, section headings, role titles), which set it explicitly.
     const buildHighlightedRuns = (text: string, size = 21) => [
@@ -4151,6 +4272,14 @@ ${JSON.stringify(repairPayload)}`,
         achievements: '关键成果',
         projects: '项目',
       },
+      Spanish: {
+        summary: 'PERFIL PROFESIONAL',
+        skills: 'HABILIDADES',
+        experience: 'EXPERIENCIA',
+        education: 'EDUCACIÓN',
+        achievements: 'LOGROS CLAVE',
+        projects: 'PROYECTOS',
+      },
     }
 
     const doc = new Document({
@@ -4287,7 +4416,7 @@ ${JSON.stringify(repairPayload)}`,
             ...draftToSave.workHistory.flatMap((item) => [
               experienceLine(
                 item.resume_title || 'Role',
-                `${monthToLabel(item.start)} - ${item.end === 'Present' ? 'Present' : monthToLabel(item.end)}`,
+                `${monthToLabel(item.start, resumeLanguage)} - ${item.end === 'Present' ? presentLabel(resumeLanguage) : monthToLabel(item.end, resumeLanguage)}`,
                 { boldLeft: true, leftSize: 21, rightSize: 19 },
               ),
               experienceLine(
@@ -4303,7 +4432,7 @@ ${JSON.stringify(repairPayload)}`,
               const degreeLine = `${edu.degree} ${edu.field ? `in ${edu.field}` : ''}`.trim()
               const metaLine = [
                 [edu.school, edu.location].filter(Boolean).join(' | '),
-                `${monthToLabel(edu.start)} - ${edu.end === 'Present' ? 'Present' : monthToLabel(edu.end)}`,
+                `${monthToLabel(edu.start, resumeLanguage)} - ${edu.end === 'Present' ? presentLabel(resumeLanguage) : monthToLabel(edu.end, resumeLanguage)}`,
               ]
                 .filter(Boolean)
                 .join(' | ')
@@ -4572,6 +4701,7 @@ ${JSON.stringify(repairPayload)}`,
                   className="rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-xs text-slate-100 focus:border-indigo-400 focus:outline-none"
                 >
                   <option value="English">English</option>
+                  <option value="Spanish">Spanish</option>
                   <option value="Japanese">Japanese</option>
                   <option value="Chinese">Chinese</option>
                 </select>
@@ -4672,16 +4802,19 @@ ${JSON.stringify(repairPayload)}`,
               className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-[13px] text-slate-100 focus:border-indigo-400 focus:outline-none"
             />
           </label>
-          <textarea
-            value={notes}
-            onChange={(event) => {
-              setNotes(event.target.value)
-              markUnsaved()
-            }}
-            rows={6}
-            placeholder="Add a target role, job link, or any notes for the AI..."
-            className="mt-4 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
-          />
+          <label className="mt-3 block text-xs font-medium text-slate-300">
+            Job description <span className="text-red-400">*</span>
+            <textarea
+              value={notes}
+              onChange={(event) => {
+                setNotes(event.target.value)
+                markUnsaved()
+              }}
+              rows={6}
+              placeholder="Paste the full job description here (minimum 100 characters)..."
+              className="mt-2 w-full resize-none overflow-y-auto rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none hide-scrollbar"
+            />
+          </label>
           {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
 
           <div className="mt-4 grid gap-4 lg:grid-cols-2">
@@ -5024,7 +5157,7 @@ ${JSON.stringify(repairPayload)}`,
                       {item.resume_title || 'Role'} · {item.company || 'Company'}
                     </p>
                     <p className="text-xs text-slate-400">
-                      {monthToLabel(item.start)} - {item.end === 'Present' ? 'Present' : monthToLabel(item.end)}
+                      {monthToLabel(item.start, resumeLanguage)} - {item.end === 'Present' ? presentLabel(resumeLanguage) : monthToLabel(item.end, resumeLanguage)}
                     </p>
                   </div>
                   {(item.location || item.workMode) && (
@@ -5133,7 +5266,7 @@ ${JSON.stringify(repairPayload)}`,
                   {item.degree} {item.field ? `in ${item.field}` : ''}
                 </p>
                 <p className="text-xs text-slate-400">
-                  {[item.school, item.location].filter(Boolean).join(' · ')} · {monthToLabel(item.start)} - {item.end === 'Present' ? 'Present' : monthToLabel(item.end)}
+                  {[item.school, item.location].filter(Boolean).join(' · ')} · {monthToLabel(item.start, resumeLanguage)} - {item.end === 'Present' ? presentLabel(resumeLanguage) : monthToLabel(item.end, resumeLanguage)}
                 </p>
               </div>
             ))}
@@ -5144,12 +5277,28 @@ ${JSON.stringify(repairPayload)}`,
         </section>
 
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
-          <h2 className="text-base font-semibold text-white">Key Achievements</h2>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-base font-semibold text-white">Key Achievements</h2>
+            <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-300">
+              <input
+                type="checkbox"
+                checked={includeKeyAchievements}
+                onChange={(event) => setIncludeKeyAchievements(event.target.checked)}
+                className="h-4 w-4 cursor-pointer rounded border-white/20 bg-slate-900/60 accent-indigo-500"
+              />
+              Include in resume
+            </label>
+          </div>
           <p className="mt-1 text-xs text-slate-400">
             One achievement per line. These lines, your work-history bullets, and Projects are the only source of real
-            numbers the generator can use — it will reuse them verbatim and never invent metrics, so the more real
-            numbers you add here, the more appear on the generated resume.
+            numbers the generator can use.
           </p>
+          {!includeKeyAchievements && (
+            <p className="mt-2 text-xs text-amber-300/90">
+              Excluded from the generated resume. Your lines are kept here and still feed real metrics into the work
+              history bullets.
+            </p>
+          )}
           <textarea
             value={(draft.keyAchievements ?? []).join('\n')}
             onChange={(event) =>
@@ -5168,8 +5317,25 @@ ${JSON.stringify(repairPayload)}`,
         </section>
 
         <section className="rounded-3xl border border-white/10 bg-slate-950/70 p-5 shadow-soft backdrop-blur lg:col-span-2">
-          <h2 className="text-base font-semibold text-white">Projects</h2>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-base font-semibold text-white">Projects</h2>
+            <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-300">
+              <input
+                type="checkbox"
+                checked={includeProjects}
+                onChange={(event) => setIncludeProjects(event.target.checked)}
+                className="h-4 w-4 cursor-pointer rounded border-white/20 bg-slate-900/60 accent-indigo-500"
+              />
+              Include in resume
+            </label>
+          </div>
           <p className="mt-1 text-xs text-slate-400">One project bullet per line.</p>
+          {!includeProjects && (
+            <p className="mt-2 text-xs text-amber-300/90">
+              Excluded from the generated resume. Your lines are kept here and still feed real metrics into the work
+              history bullets.
+            </p>
+          )}
           <textarea
             value={(draft.projects ?? []).join('\n')}
             onChange={(event) =>
