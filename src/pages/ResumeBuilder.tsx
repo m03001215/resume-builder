@@ -36,6 +36,7 @@ import {
   type QualityRole,
 } from '../lib/bulletQuality'
 import { enforceNaturalPhrasing } from '../lib/jdEcho'
+import { refineParsedSkills } from '../lib/skillQuality'
 import { computeExperienceYears, removeMetaCommentary } from '../lib/resumeHygiene'
 import { enforceTechTimeline, type TimelineRole } from '../lib/techTimeline'
 
@@ -341,102 +342,12 @@ const getResumeContactEmail = (profile: ReturnType<typeof useAuth>['profile']) =
   return (profile?.email ?? '').toString().trim()
 }
 
-const generalizeJobTitle = (rawTitle: string, jobDescription: string) => {
-  const raw = (rawTitle ?? '').toString().replace(/\s+/g, ' ').trim()
-  if (!raw) return ''
-
-  const jd = (jobDescription ?? '').toString().toLowerCase()
-  const norm = raw.replace(/[–—]/g, '-').trim()
-
-  const stripParens = (s: string) => s.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim()
-  const stripTrailingQualifiers = (s: string) => {
-    // Remove trailing qualifiers after dash if they look like org/platform/location info.
-    const parts = s.split(/\s+-\s+/).map((p) => p.trim()).filter(Boolean)
-    if (parts.length <= 1) return s.trim()
-    const right = parts.slice(1).join(' - ').toLowerCase()
-    const rightLooksQualifier = /\b(remote|hybrid|onsite|on[- ]site|work from|wfh|anywhere|timezone|martech|platform|team|org|organization|dept|department|group|pod|squad|connect|growth|payments|infra|infrastructure)\b/.test(
-      right,
-    )
-    return rightLooksQualifier ? parts[0] : s.trim()
-  }
-
-  // Start with cleaned title.
-  let base = stripTrailingQualifiers(norm)
-
-  // Drop parentheses that are clearly not part of the role.
-  const parenContent = (norm.match(/\(([^)]*)\)/) ?? [])[1]?.toLowerCase() ?? ''
-  const parenLooksQualifier = /\b(remote|hybrid|onsite|on[- ]site|work from|wfh|anywhere|timezone|platform|team|dept|department|connect|martech)\b/.test(
-    parenContent,
-  )
-  if (parenLooksQualifier) base = stripParens(base)
-
-  // If still has parentheses, keep only specialization-like ones by turning them into prefix.
-  const specialization = (norm.match(/\((backend|frontend|full\s*stack|fullstack|mobile|ios|android|devops|sre|data|ml|machine learning|security|qa|sdet)\)/i) ??
-    [])[1]
-  base = stripParens(base)
-
-  const cleaned = base.replace(/\s+/g, ' ').trim()
-  if (!cleaned) return raw
-
-  // If title is very generic, refine from JD signals.
-  const lowerTitle = cleaned.toLowerCase()
-  // Only a title that carries no domain of its own may be re-inferred from the JD.
-  // "Security Engineer" or "QA Engineer" already name their role, and rewriting them
-  // from keyword counts is how a resume ends up aimed at the wrong job.
-  const withoutSeniority = lowerTitle
-    .replace(/\b(intern|junior|jr\.?|mid|mid-level|senior|sr\.?|staff|principal|lead)\b/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-  const isGenericSE = /^(?:software\s+)?(?:engineer|developer|programmer|engineering)$/.test(withoutSeniority)
-
-  const score = (patterns: RegExp[]) => patterns.reduce((acc, r) => acc + (r.test(jd) ? 1 : 0), 0)
-  // Terms that appear in almost any engineering JD regardless of role (ui, model,
-  // training, bare "ml") are deliberately excluded: they only add noise to the counts.
-  const frontScore = score([/\breact\b/, /\btypescript\b/, /\bfrontend\b/, /\bcss\b/, /\bnext\.js\b/, /\btailwind\b/])
-  const backScore = score([/\bbackend\b/, /\bapi\b/, /\brest\b/, /\bgraphql\b/, /\bpostgres\b/, /\bmysql\b/, /\bredis\b/, /\bnode\.js\b/, /\bpython\b/, /\bjava\b/])
-  const dataScore = score([/\bdata engineer\b/, /\betl\b/, /\bspark\b/, /\bwarehouse\b/, /\bairflow\b/, /\bdbt\b/])
-  const devopsScore = score([/\bdevops\b/, /\bsre\b/, /\bkubernetes\b/, /\bdocker\b/, /\bterraform\b/, /\bci\/cd\b/])
-  const mlScore = score([/\bmachine learning\b/, /\bllm\b/, /\bpytorch\b/, /\btensorflow\b/, /\bmodel training\b/])
-
-  const preserveSeniority = () => {
-    const m = cleaned.match(/\b(intern|junior|jr\.|mid|senior|sr\.|staff|principal|lead|manager|director|vp|head)\b/i)
-    return m ? m[0].replace(/\.$/, '') : ''
-  }
-  const seniority = preserveSeniority()
-
-  const pick = (role: string) => (seniority ? `${seniority} ${role}`.replace(/\s+/g, ' ').trim() : role)
-
-  let inferred: string | null = null
-  if (isGenericSE) {
-    // Rank instead of Math.max: the old else-if chain broke ties by source order, so a
-    // 1-vs-1 coincidence silently picked a role. Require a clear win before rewriting.
-    const ranked = [
-      { role: 'Frontend Engineer', value: frontScore },
-      { role: 'Backend Engineer', value: backScore },
-      { role: 'Data Engineer', value: dataScore },
-      { role: 'DevOps Engineer', value: devopsScore },
-      { role: 'Machine Learning Engineer', value: mlScore },
-    ].sort((a, b) => b.value - a.value)
-    const [top, runnerUp] = ranked
-    if (top.value >= 2 && top.value > runnerUp.value) inferred = pick(top.role)
-  }
-
-  // Apply specialization prefix if we captured one (and didn’t infer a more specific role).
-  if (!inferred && specialization) {
-    const spec = specialization.toLowerCase()
-    if (spec.includes('backend')) inferred = pick('Backend Engineer')
-    else if (spec.includes('frontend')) inferred = pick('Frontend Engineer')
-    else if (spec.includes('full')) inferred = pick('Full Stack Engineer')
-    else if (spec.includes('devops') || spec.includes('sre')) inferred = pick('DevOps Engineer')
-    else if (spec.includes('data')) inferred = pick('Data Engineer')
-    else if (spec.includes('ml') || spec.includes('machine')) inferred = pick('Machine Learning Engineer')
-    else if (spec.includes('security')) inferred = pick('Security Engineer')
-    else if (spec.includes('qa') || spec.includes('sdet')) inferred = pick('QA Engineer')
-    else if (spec.includes('mobile') || spec.includes('ios') || spec.includes('android')) inferred = pick('Mobile Engineer')
-  }
-
-  return (inferred ?? cleaned).replace(/\s+/g, ' ').trim()
-}
+// The job title is used exactly as the user typed it — in the resume header, cover letter, file
+// and folder names, and the saved application record — and the whole resume is generated for it.
+// Only whitespace is tidied. (This replaces an older "generalize" step that stripped qualifiers
+// like "(Remote)" or "- Payments" and re-inferred generic titles from JD keyword counts, so the
+// materials and the content could drift away from the title that was entered.)
+const normalizeJobTitle = (rawTitle: string) => (rawTitle ?? '').toString().replace(/\s+/g, ' ').trim()
 
 const getResumeStylePreset = (style: ResumeStyle): ResumeStylePreset =>
   RESUME_STYLE_PRESETS[style] ?? RESUME_STYLE_PRESETS.Classic
@@ -2476,9 +2387,9 @@ A: <answer>
 
   const applyParsedToDraft = (
     prev: ResumeDraft,
-    args: { parsed: any; parsedWithTitles: any; jobTitleFallback: string },
+    args: { parsed: any; parsedWithTitles: any; inputJobTitle: string },
   ): ResumeDraft => {
-    const { parsed, parsedWithTitles, jobTitleFallback } = args
+    const { parsedWithTitles, inputJobTitle } = args
 
     // determine grouped skill categories and the flattened list that mirrors them
     let flatSkills: string[] | undefined = undefined
@@ -2632,7 +2543,7 @@ A: <answer>
         resume_title:
           nextResumeTitle ??
           item.resume_title ??
-          sanitizeText(parsed?.targetTitle || jobTitleFallback || '') ??
+          sanitizeText(inputJobTitle || '') ??
           '',
         bullets: finalBullets,
       }
@@ -2640,7 +2551,8 @@ A: <answer>
 
     return {
       ...prev,
-      targetTitle: parsedWithTitles?.targetTitle ? sanitizeText(parsedWithTitles.targetTitle) : prev.targetTitle,
+      // The headline title is always the job title the user entered, never the model's rewording.
+      targetTitle: inputJobTitle || prev.targetTitle,
       summary: parsedWithTitles?.summary
         ? stripPlaceholderMetrics(sanitizeText(parsedWithTitles.summary))
         : prev.summary,
@@ -2826,7 +2738,7 @@ A: <answer>
       return
     }
 
-    const generalizedJobTitle = generalizeJobTitle(jobTitle, notes)
+    const exactJobTitle = normalizeJobTitle(jobTitle)
 
     if (!jobUrl.trim()) {
       const msg = 'Please enter a Job URL before generating.'
@@ -2931,12 +2843,15 @@ A: <answer>
               )}
 
 INSTRUCTIONS:
-0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
+0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys, and keep targetTitle exactly as entered (see 0.1).
    - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (role-agnostic): The resume must read like a "${generalizedJobTitle}" resume first.
+0.1 Target role focus (strict): The candidate is applying for exactly this job title: "${exactJobTitle}". The whole resume must be written for THAT title.
+   - targetTitle MUST be exactly "${exactJobTitle}" — the same words, spelling and capitalization; do not reword, translate, shorten, or "improve" it.
+   - The title decides the role; the job description adds detail. If the job description also covers areas outside the title (e.g., the title is a frontend role but the posting mentions some backend work), lead with what the title implies and treat the rest as secondary.
+   - The summary positions the candidate as a "${exactJobTitle}", and the bullets, skills order and cover letter all emphasize the work that title implies.
    - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
    - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${generalizedJobTitle}" and are supported by the payload + job description.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${exactJobTitle}" and are supported by the payload + job description.
    - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
    - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
 0.2 Experience titles (required):
@@ -2999,7 +2914,7 @@ The resume must read as the candidate's own account of their career that happens
 6. Never invent new roles, companies, job titles, or project domains.
 15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure — but only in roles whose dates allow it (see 0.6).
 16. Never invent new roles, companies, job titles, or project domains.
-17. Generate a target title that closely mirrors the job description title and aligns with the candidate's career progression.
+17. targetTitle is the job title the candidate entered, copied exactly (see 0.1). Do not derive it from the job description's wording.
 18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. payload.yearsOfExperience is the candidate's total professional experience in whole years, already computed for you — use it exactly; never recompute it from dates and never round it up.
    - If payload.yearsOfExperience is 1 or more, mention it once, naturally (see below).
    - If it is 0 or null, do NOT mention any number of years, and do not mention dates, data, or how much experience is or is not known. Open with the role and the candidate's strengths instead (e.g., "Software engineer focused on building reliable web applications with React and Node.js...").
@@ -3014,13 +2929,15 @@ The resume must read as the candidate's own account of their career that happens
 24. Experience bullets start with a strong past-tense action verb (for every role, including the current one) and describe what was done and why it mattered. Vary the shape so they do not read as a template: some lead with the problem, some with the result, some name technologies and some do not, and no two bullets in the same role start with the same verb.
 25. The bullets should be outcome-driven and include real metrics wherever the payload has them; where it does not, the outcome is stated concretely (what changed, for whom) rather than as a vague improvement. See "Bullets (strict)" below for the full specification.
 27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
-27.1 Derive 6–9 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration). Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
+27.1 Derive 4–7 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods). Never create a soft-skills category. Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
 27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category by importance to the role — never reproduce the order in which the job description lists them. Mix in the candidate's own relevant skills from the payload so the section reflects their background, not just the posting.
 27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
 27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
-28. Include 30–45 skills IN TOTAL across all categories (roughly 4–8 per category), all relevant to the job description. Be comprehensive about the job description's stack: languages, frameworks, libraries, datastores, cloud services, infrastructure and CI/CD tooling, testing tools, APIs/protocols/data formats, monitoring, and ways of working. Prefer a rich, specific list over a short generic one.
-28.1 Do not pad the list with vague filler ("problem solving", "hard working") or with near-duplicates of a skill already listed; every entry must be a concrete, nameable technology, tool, or practice.
-28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 30 skills, output fewer rather than inventing expertise the candidate does not have.
+28. Include 18–30 skills IN TOTAL across all categories (roughly 3–6 per category), all relevant to the job description: languages, frameworks, libraries, datastores, specific cloud services, CI/CD and infrastructure tooling, testing tools, APIs/protocols/data formats, and monitoring. A short list of specific skills beats a long list padded with generic ones.
+28.1 Every skill is a specific, named thing a reviewer could ask "how did you use it?" about — name the actual tool, not the area: "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" or "Playwright" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control"; "Datadog" not "Monitoring".
+   - NEVER include soft skills or umbrella terms: communication, teamwork, leadership, mentoring, problem solving, attention to detail, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP, scalability. Named methods are fine: CI/CD, Microservices, REST, GraphQL, TDD, Agile, Scrum, Event-Driven Architecture.
+   - Each item is 1–3 words: no "Proficient in ...", no descriptions, no parentheses, no near-duplicates ("React" and "React.js").
+28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 18 skills, output fewer rather than inventing expertise the candidate does not have.
 29. Every P1 technology the candidate can honestly claim must appear in Skills, and in Experience wherever it was genuinely part of the work. P2 technologies go in Skills, and in Experience only where they fit naturally. In Experience, place each one only under a role whose dates allow it (see 0.6); if no role's dates allow it, list it in Skills only.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, check two things: every supportable P1 technology is present in a logical context, and no output field contains 6 or more consecutive words copied from the job description (rephrase any that do).
@@ -3034,7 +2951,7 @@ Additional rules (apply exactly):
 
 - Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
-- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
+- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting. When the letter names the position, use the exact targetTitle (see 0.1), never a reworded version.
   - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
   - Voice: write it as the candidate would, connecting 2–3 real experiences to what the role needs. Do not walk through the job description's requirements in order, and do not quote or closely paraphrase its sentences (see NATURAL TAILORING).
 
@@ -3116,10 +3033,11 @@ If you understand, return the single JSON object now.`,
       }
 
       const ensureSkills = async (draftParsed: any) => {
-        const existing = flattenClaimedSkills(draftParsed, sanitizeModelText)
+        // Generic entries ("Databases", "Communication") are removed first so they never count as skills.
+        const existing = flattenClaimedSkills(Object.assign(draftParsed, refineParsedSkills(draftParsed)), sanitizeModelText)
 
         const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-        if (unique.length >= 24) {
+        if (unique.length >= 18) {
           // Keep the flat mirror in sync for the downstream repair passes.
           draftParsed.claimedSkills = unique
           return draftParsed
@@ -3153,13 +3071,15 @@ If you understand, return the single JSON object now.`,
               },
               {
                 role: 'user',
-                content: `Expand the resume skills to 30–45 items IN TOTAL, grouped into categories, prioritizing job-description relevance.
+                content: `Expand the resume skills to 18–30 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, protocol or method.
 
 Rules:
 - Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
-- Use 6–9 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration), using conventional category names rather than headings or phrases copied from the job description.
-- Aim for roughly 4–8 skills per category and cover the job description's stack comprehensively (languages, frameworks, datastores, cloud, CI/CD, testing, APIs/protocols, monitoring, ways of working).
-- Do not pad with vague filler ("problem solving", "team player") or near-duplicates; every entry must be a concrete, nameable technology, tool, or practice.
+- Use 4–7 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
+- Aim for roughly 3–6 skills per category, covering the job description's stack (languages, frameworks, datastores, cloud services, CI/CD, testing, APIs/protocols, monitoring).
+- Be specific: name the actual thing, not the area. "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control".
+- Never include soft skills or umbrella terms: communication, teamwork, leadership, problem solving, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP. Named methods are fine (CI/CD, Microservices, REST, TDD, Agile, Scrum).
+- Keep each item to 1–3 words: no "Proficient in", no descriptions, no parentheses.
 - Order categories by relevance to the job description (most relevant first), and order skills within each category by importance to the role; never reproduce the order in which the job description lists them. Keep the candidate's own relevant skills from payloadSkills alongside the job's.
 - Every skill must appear in exactly ONE category (no duplicates across categories).
 - Avoid a generic "Other"/"Miscellaneous" category unless a relevant skill fits nowhere else.
@@ -3179,12 +3099,14 @@ ${JSON.stringify(repairPayload)}`,
 
         const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
         const repaired = parseModelJson(repairContent)
-        const nextCategories = repaired?.claimedSkillsByCategory
-        const next = flattenClaimedSkills(repaired, sanitizeModelText)
+        // Count only specific skills, so a repair padded with generic terms does not "win".
+        const refinedRepair = refineParsedSkills(repaired ?? {})
+        const nextCategories = refinedRepair.claimedSkillsByCategory
+        const next = flattenClaimedSkills(refinedRepair, sanitizeModelText)
         // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
         if (next.length > unique.length) {
           draftParsed.claimedSkillsByCategory = nextCategories
-          draftParsed.claimedSkills = next.slice(0, 45)
+          draftParsed.claimedSkills = next.slice(0, 30)
         }
         return draftParsed
       }
@@ -3262,7 +3184,7 @@ ${JSON.stringify(repairPayload)}`,
         }
 
         // Ensure the array has every id exactly once.
-        draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(draftParsed?.targetTitle ?? jobTitle) })
+        draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(exactJobTitle) })
         return draftParsed
       }
 
@@ -3371,7 +3293,7 @@ ${JSON.stringify(repairPayload)}`,
       const nextDraft = applyParsedToDraft(draft, {
         parsed,
         parsedWithTitles,
-        jobTitleFallback: generalizedJobTitle,
+        inputJobTitle: exactJobTitle,
       })
       setDraft(nextDraft)
       setIsDraftDirty(true)
@@ -3392,7 +3314,7 @@ ${JSON.stringify(repairPayload)}`,
 
       setResultDialog({
         companyName: companyName.trim(),
-        jobTitle: generalizedJobTitle,
+        jobTitle: exactJobTitle,
         rootFolderName: downloadHandleName,
         folderName: downloadResult.folderName,
         files: downloadResult.files,
@@ -3401,7 +3323,7 @@ ${JSON.stringify(repairPayload)}`,
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
-      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, generalizedJobTitle))
+      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, exactJobTitle))
       setHasGenerated(true)
       setIsGenerating(false)
     }
@@ -3417,7 +3339,7 @@ ${JSON.stringify(repairPayload)}`,
     const yearsOfExperience = computeExperienceYears(base.workHistory)
 
     const jobTitleInput = (item.jobTitle ?? '').trim()
-    const generalizedJobTitleInput = generalizeJobTitle(jobTitleInput, item.jobDescription ?? '')
+    const exactJobTitleInput = normalizeJobTitle(jobTitleInput)
     const notesInput = (item.jobDescription ?? '').trim()
 
     const payload = {
@@ -3466,12 +3388,15 @@ ${JSON.stringify(repairPayload)}`,
             )}
 
 INSTRUCTIONS:
-0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, targetTitle, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys.
+0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys, and keep targetTitle exactly as entered (see 0.1).
    - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (role-agnostic): The resume must read like a "${generalizedJobTitleInput}" resume first.
+0.1 Target role focus (strict): The candidate is applying for exactly this job title: "${exactJobTitleInput}". The whole resume must be written for THAT title.
+   - targetTitle MUST be exactly "${exactJobTitleInput}" — the same words, spelling and capitalization; do not reword, translate, shorten, or "improve" it.
+   - The title decides the role; the job description adds detail. If the job description also covers areas outside the title (e.g., the title is a frontend role but the posting mentions some backend work), lead with what the title implies and treat the rest as secondary.
+   - The summary positions the candidate as a "${exactJobTitleInput}", and the bullets, skills order and cover letter all emphasize the work that title implies.
    - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
    - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${generalizedJobTitleInput}" and are supported by the payload + job description.
+   - Prioritize responsibilities, technologies, and achievements that are typical for "${exactJobTitleInput}" and are supported by the payload + job description.
    - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
    - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
 0.2 Experience titles (required):
@@ -3525,7 +3450,7 @@ The resume must read as the candidate's own account of their career that happens
 6. Never invent new roles, companies, job titles, or project domains.
 15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure — but only in roles whose dates allow it (see 0.6).
 16. Never invent new roles, companies, job titles, or project domains.
-17. Generate a target title that closely mirrors the job description title and aligns with the candidate's career progression.
+17. targetTitle is the job title the candidate entered, copied exactly (see 0.1). Do not derive it from the job description's wording.
 18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. payload.yearsOfExperience is the candidate's total professional experience in whole years, already computed for you — use it exactly; never recompute it from dates and never round it up.
    - If payload.yearsOfExperience is 1 or more, mention it once, naturally (see below).
    - If it is 0 or null, do NOT mention any number of years, and do not mention dates, data, or how much experience is or is not known. Open with the role and the candidate's strengths instead (e.g., "Software engineer focused on building reliable web applications with React and Node.js...").
@@ -3540,13 +3465,15 @@ The resume must read as the candidate's own account of their career that happens
 24. Experience bullets start with a strong past-tense action verb (for every role, including the current one) and describe what was done and why it mattered. Vary the shape so they do not read as a template: some lead with the problem, some with the result, some name technologies and some do not, and no two bullets in the same role start with the same verb.
 25. The bullets should be outcome-driven and include real metrics wherever the payload has them; where it does not, the outcome is stated concretely (what changed, for whom) rather than as a vague improvement. See "Bullets (strict)" below for the full specification.
 27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
-27.1 Derive 6–9 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration). Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
+27.1 Derive 4–7 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods). Never create a soft-skills category. Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
 27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category by importance to the role — never reproduce the order in which the job description lists them. Mix in the candidate's own relevant skills from the payload so the section reflects their background, not just the posting.
 27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
 27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
-28. Include 30–45 skills IN TOTAL across all categories (roughly 4–8 per category), all relevant to the job description. Be comprehensive about the job description's stack: languages, frameworks, libraries, datastores, cloud services, infrastructure and CI/CD tooling, testing tools, APIs/protocols/data formats, monitoring, and ways of working. Prefer a rich, specific list over a short generic one.
-28.1 Do not pad the list with vague filler ("problem solving", "hard working") or with near-duplicates of a skill already listed; every entry must be a concrete, nameable technology, tool, or practice.
-28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 30 skills, output fewer rather than inventing expertise the candidate does not have.
+28. Include 18–30 skills IN TOTAL across all categories (roughly 3–6 per category), all relevant to the job description: languages, frameworks, libraries, datastores, specific cloud services, CI/CD and infrastructure tooling, testing tools, APIs/protocols/data formats, and monitoring. A short list of specific skills beats a long list padded with generic ones.
+28.1 Every skill is a specific, named thing a reviewer could ask "how did you use it?" about — name the actual tool, not the area: "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" or "Playwright" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control"; "Datadog" not "Monitoring".
+   - NEVER include soft skills or umbrella terms: communication, teamwork, leadership, mentoring, problem solving, attention to detail, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP, scalability. Named methods are fine: CI/CD, Microservices, REST, GraphQL, TDD, Agile, Scrum, Event-Driven Architecture.
+   - Each item is 1–3 words: no "Proficient in ...", no descriptions, no parentheses, no near-duplicates ("React" and "React.js").
+28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 18 skills, output fewer rather than inventing expertise the candidate does not have.
 29. Every P1 technology the candidate can honestly claim must appear in Skills, and in Experience wherever it was genuinely part of the work. P2 technologies go in Skills, and in Experience only where they fit naturally. In Experience, place each one only under a role whose dates allow it (see 0.6); if no role's dates allow it, list it in Skills only.
 30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
 31. Before final output, check two things: every supportable P1 technology is present in a logical context, and no output field contains 6 or more consecutive words copied from the job description (rephrase any that do).
@@ -3560,7 +3487,7 @@ Additional rules (apply exactly):
 
 - Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
 
-- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting.
+- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting. When the letter names the position, use the exact targetTitle (see 0.1), never a reworded version.
   - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
   - Voice: write it as the candidate would, connecting 2–3 real experiences to what the role needs. Do not walk through the job description's requirements in order, and do not quote or closely paraphrase its sentences (see NATURAL TAILORING).
 
@@ -3637,10 +3564,11 @@ If you understand, return the single JSON object now.`,
     }
 
     const ensureSkills = async (draftParsed: any) => {
-      const existing = flattenClaimedSkills(draftParsed, sanitizeModelText)
+      // Generic entries ("Databases", "Communication") are removed first so they never count as skills.
+      const existing = flattenClaimedSkills(Object.assign(draftParsed, refineParsedSkills(draftParsed)), sanitizeModelText)
 
       const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-      if (unique.length >= 24) {
+      if (unique.length >= 18) {
         // Keep the flat mirror in sync for the downstream repair passes.
         draftParsed.claimedSkills = unique
         return draftParsed
@@ -3648,7 +3576,7 @@ If you understand, return the single JSON object now.`,
 
       const repairPayload = {
         resumeLanguage,
-        targetJobTitle: generalizedJobTitleInput,
+        targetJobTitle: exactJobTitleInput,
         jobDescription: notesInput,
         existingSkills: unique,
         existingCategories: draftParsed?.claimedSkillsByCategory ?? {},
@@ -3673,13 +3601,15 @@ If you understand, return the single JSON object now.`,
             },
             {
               role: 'user',
-              content: `Expand the resume skills to 30–45 items IN TOTAL, grouped into categories, prioritizing job-description relevance.
+              content: `Expand the resume skills to 18–30 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, protocol or method.
 
 Rules:
 - Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
-- Use 6–9 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing & Quality, APIs & Integration, Practices & Collaboration), using conventional category names rather than headings or phrases copied from the job description.
-- Aim for roughly 4–8 skills per category and cover the job description's stack comprehensively (languages, frameworks, datastores, cloud, CI/CD, testing, APIs/protocols, monitoring, ways of working).
-- Do not pad with vague filler ("problem solving", "team player") or near-duplicates; every entry must be a concrete, nameable technology, tool, or practice.
+- Use 4–7 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
+- Aim for roughly 3–6 skills per category, covering the job description's stack (languages, frameworks, datastores, cloud services, CI/CD, testing, APIs/protocols, monitoring).
+- Be specific: name the actual thing, not the area. "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control".
+- Never include soft skills or umbrella terms: communication, teamwork, leadership, problem solving, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP. Named methods are fine (CI/CD, Microservices, REST, TDD, Agile, Scrum).
+- Keep each item to 1–3 words: no "Proficient in", no descriptions, no parentheses.
 - Order categories by relevance to the job description (most relevant first), and order skills within each category by importance to the role; never reproduce the order in which the job description lists them. Keep the candidate's own relevant skills from payloadSkills alongside the job's.
 - Every skill must appear in exactly ONE category (no duplicates across categories).
 - Avoid a generic "Other"/"Miscellaneous" category unless a relevant skill fits nowhere else.
@@ -3699,12 +3629,14 @@ ${JSON.stringify(repairPayload)}`,
 
       const repairContent = repairData?.choices?.[0]?.message?.content ?? ''
       const repaired = parseModelJson(repairContent)
-      const nextCategories = repaired?.claimedSkillsByCategory
-      const next = flattenClaimedSkills(repaired, sanitizeModelText)
+      // Count only specific skills, so a repair padded with generic terms does not "win".
+      const refinedRepair = refineParsedSkills(repaired ?? {})
+      const nextCategories = refinedRepair.claimedSkillsByCategory
+      const next = flattenClaimedSkills(refinedRepair, sanitizeModelText)
       // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
       if (next.length > unique.length) {
         draftParsed.claimedSkillsByCategory = nextCategories
-        draftParsed.claimedSkills = next.slice(0, 45)
+        draftParsed.claimedSkills = next.slice(0, 30)
       }
       return draftParsed
     }
@@ -3724,7 +3656,7 @@ ${JSON.stringify(repairPayload)}`,
       if (missingIds.length === 0) return draftParsed
 
       const repairPayload = {
-        targetJobTitle: generalizedJobTitleInput,
+        targetJobTitle: exactJobTitleInput,
         targetTitle: draftParsed?.targetTitle ?? '',
         jobDescription: notesInput,
         workHistory: payload.workHistory.map((w) => ({
@@ -3779,7 +3711,7 @@ ${JSON.stringify(repairPayload)}`,
         byId.set(r.id, { ...existing, resumeTitle: rt })
       }
 
-      draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(draftParsed?.targetTitle ?? jobTitleInput) })
+      draftParsed.workHistory = requestedIds.map((id) => byId.get(id) ?? { id, resumeTitle: sanitizeModelText(exactJobTitleInput) })
       return draftParsed
     }
 
@@ -3802,7 +3734,7 @@ ${JSON.stringify(repairPayload)}`,
 
       const repairPayload = {
         resumeLanguage,
-        targetJobTitle: generalizedJobTitleInput,
+        targetJobTitle: exactJobTitleInput,
         targetTitle: draftParsed?.targetTitle ?? '',
         jobDescription: notesInput,
         summary: draftParsed?.summary ?? payload.summary,
@@ -3880,7 +3812,7 @@ ${JSON.stringify(repairPayload)}`,
       apiKey,
       model,
     })
-    return applyParsedToDraft(base, { parsed, parsedWithTitles, jobTitleFallback: generalizedJobTitleInput })
+    return applyParsedToDraft(base, { parsed, parsedWithTitles, inputJobTitle: exactJobTitleInput })
   }
 
   const handleJobListFileSelected = async (file?: File | null) => {
@@ -4093,7 +4025,7 @@ ${JSON.stringify(repairPayload)}`,
     setIsSaving(true)
     setError(null)
     const resolvedCompanyName = companyName.trim()
-    const resolvedJobTitle = generalizeJobTitle(jobTitle, notes)
+    const resolvedJobTitle = normalizeJobTitle(jobTitle)
     const fileNames = buildFileNames(profile, resolvedCompanyName, resolvedJobTitle)
     const { error: insertError } = await supabase.from('applied_jobs').insert({
       profile_id: profile.id,
@@ -4146,7 +4078,7 @@ ${JSON.stringify(repairPayload)}`,
     const draftToSave = applySectionToggles(rawDraftToSave)
 
     const fullName = buildCandidateFullName(profile)
-    const titleLine = (draftToSave.targetTitle || jobTitleToSave || '').trim()
+    const titleLine = (jobTitleToSave || draftToSave.targetTitle || '').trim()
     const locationLine = profile?.location ?? ''
     const contactLine = [profile?.phone_number, getResumeContactEmail(profile), profile?.linkedin_url, profile?.github_url]
       .filter((value): value is string => Boolean(value && value.trim()))
@@ -4558,19 +4490,19 @@ ${JSON.stringify(repairPayload)}`,
       profile,
       draft: draftToSave,
       companyName: companyNameToSave || '',
-      jobTitle: (draftToSave.targetTitle || jobTitleToSave || '').trim(),
+      jobTitle: (jobTitleToSave || draftToSave.targetTitle || '').trim(),
       language: resumeLanguage,
       style: resumeStyle,
     })
     const fullNameSlug = sanitizeFilePart(buildCandidateFullName(profile), 'candidate')
-    const roleSlug = sanitizeFilePart((draftToSave.targetTitle || jobTitleToSave || '').trim(), 'role')
+    const roleSlug = sanitizeFilePart((jobTitleToSave || draftToSave.targetTitle || '').trim(), 'role')
     const companySlug = sanitizeFilePart(companyNameToSave || '', 'company')
     const folderName = `${fullNameSlug}_${roleSlug}_${companySlug}`
     const coverText = draftToSave.coverLetter || ''
     const coverPdfBlob = buildCoverLetterPdfBlob({ profile, draft: draftToSave, language: resumeLanguage })
 
     const resumeBaseName = sanitizeFileName(
-      `${buildCandidateFullName(profile) || 'Candidate'} - ${(draftToSave.targetTitle || jobTitleToSave || 'Role').trim()}`,
+      `${buildCandidateFullName(profile) || 'Candidate'} - ${(jobTitleToSave || draftToSave.targetTitle || 'Role').trim()}`,
       'Resume',
     )
     const resumeDocxName = `${resumeBaseName}.docx`
@@ -4717,7 +4649,7 @@ ${JSON.stringify(repairPayload)}`,
     // Manual downloads report completion through the same dialog, not a toast.
     setResultDialog({
       companyName: companyName.trim(),
-      jobTitle: generalizeJobTitle(jobTitle, notes),
+      jobTitle: normalizeJobTitle(jobTitle),
       rootFolderName: downloadHandleName,
       folderName: result.folderName,
       files: result.files,
