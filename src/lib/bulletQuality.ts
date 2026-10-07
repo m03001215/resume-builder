@@ -245,11 +245,14 @@ export const ensureBulletCount = async <T extends { workHistory?: unknown }>(arg
   draftParsed: T
   roles: QualityRole[]
   jobDescription: string
+  // Core job-description technologies no bullet shows yet (see jdRelevance); new bullets cover
+  // these first.
+  uncoveredTechnologies?: string[]
   language: string
   sanitize: (value: unknown) => string
   requestBullets: (system: string, user: string) => Promise<Array<{ id: string; bullets: unknown[] }> | null>
 }): Promise<T> => {
-  const { draftParsed, roles, jobDescription, language, sanitize, requestBullets } = args
+  const { draftParsed, roles, jobDescription, uncoveredTechnologies = [], language, sanitize, requestBullets } = args
   const entries = Array.isArray(draftParsed?.workHistory)
     ? (draftParsed.workHistory as Array<{ id?: unknown; bullets?: unknown }>)
     : []
@@ -281,7 +284,12 @@ export const ensureBulletCount = async <T extends { workHistory?: unknown }>(arg
 Rules:
 - Each bullet is one specific story in one sentence of 12–25 words: the situation or problem -> what the candidate specifically built, changed or decided -> the result.
 - Each bullet has at least two concrete anchors: a named thing worked on (service, page, job, pipeline, tool, flow), a specific technical decision or method, a real number, a concrete before -> after, or a specifically named group it was for.
-- Cover a DIFFERENT piece of work from currentBullets — do not restate, split or reword an existing bullet. Draw on the full range of real work in such a role: features shipped, bugs or incidents fixed, migrations, performance work, tests and tooling, CI/CD, code reviews and mentoring, documentation, on-call.
+- Priority for every new bullet: demonstrate a requirement of the job description below that this role's currentBullets do not yet show — a responsibility, a problem area, or a technology (technologies only if they existed during the role's dates). Only once every requirement this role can support is shown may a bullet cover other strong work in the role.
+- Cover a DIFFERENT piece of work from currentBullets — do not restate, split or reword an existing bullet — and vary the angle (building, migrating, scaling, operating, testing, integrating, leading).${
+    uncoveredTechnologies.length > 0
+      ? `\n- These job-description technologies are not demonstrated anywhere in the resume yet. Where a role's dates and title make it plausible, show real work with them: ${JSON.stringify(uncoveredTechnologies)}.`
+      : ''
+  }
 - Base everything on the role's title, company, dates and candidateBullets. Use numbers ONLY if they appear in candidateBullets. Never invent customer names, branded products or awards.
 - Only name technologies that existed during the role's dates (start to end), and keep them relevant to the job description below without copying its wording.
 - No filler: leveraged, utilized, spearheaded, robust, seamless, best practices, various, responsible for, worked on, contributed to, to ensure, in order to, high-quality.

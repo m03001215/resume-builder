@@ -36,7 +36,9 @@ import {
   type QualityRole,
 } from '../lib/bulletQuality'
 import { enforceNaturalPhrasing } from '../lib/jdEcho'
-import { refineParsedSkills } from '../lib/skillQuality'
+import { enforceJdRelevance, uncoveredCoreTechnologies } from '../lib/jdRelevance'
+import { buildResumePrompt, RESUME_SYSTEM_PROMPT } from '../lib/resumePrompt'
+import { backfillSkillsFromBullets, refineParsedSkills } from '../lib/skillQuality'
 import { computeExperienceYears, removeMetaCommentary } from '../lib/resumeHygiene'
 import { enforceTechTimeline, type TimelineRole } from '../lib/techTimeline'
 
@@ -277,6 +279,8 @@ const requestModelJsonFrom = (apiKey: string, model: string) => async (system: s
 const polishGeneratedResume = async <T extends { workHistory?: unknown }>(args: {
   draftParsed: T
   jobDescription: string
+  // Exactly as the user entered it.
+  jobTitle: string
   roles: Array<QualityRole & TimelineRole>
   // The candidate's own text; the only place a number in a bullet may come from.
   evidenceTexts: string[]
@@ -291,8 +295,19 @@ const polishGeneratedResume = async <T extends { workHistory?: unknown }>(args: 
     return Array.isArray(parsed?.rewrites) ? parsed.rewrites : null
   }
   const runChecks = async (draftParsed: T) => {
-    const specific = await enforceSpecificBullets({
+    // Re-angle off-target bullets toward the job first; every later check then applies to them.
+    const relevant = await enforceJdRelevance({
       draftParsed,
+      roles: args.roles,
+      jobDescription: args.jobDescription,
+      jobTitle: args.jobTitle,
+      evidenceTexts: args.evidenceTexts,
+      language: args.language,
+      sanitize: args.sanitize,
+      requestRewrites,
+    })
+    const specific = await enforceSpecificBullets({
+      draftParsed: relevant,
       roles: args.roles,
       evidenceTexts: args.evidenceTexts,
       language: args.language,
@@ -325,6 +340,15 @@ const polishGeneratedResume = async <T extends { workHistory?: unknown }>(args: 
     draftParsed: checked,
     roles: args.roles,
     jobDescription: args.jobDescription,
+    // Any core job-description technology still missing after the checks is the first thing a
+    // new bullet should demonstrate.
+    uncoveredTechnologies: uncoveredCoreTechnologies({
+      draftParsed: checked,
+      roles: args.roles,
+      jobDescription: args.jobDescription,
+      jobTitle: args.jobTitle,
+      sanitize: args.sanitize,
+    }),
     language: args.language,
     sanitize: args.sanitize,
     requestBullets: async (system, user) => {
@@ -332,7 +356,9 @@ const polishGeneratedResume = async <T extends { workHistory?: unknown }>(args: 
       return Array.isArray(parsed?.workHistory) ? parsed.workHistory : null
     },
   })
-  return topped === checked ? checked : runChecks(topped)
+  const finalDraft = topped === checked ? checked : await runChecks(topped)
+  // Skills last, from the final bullets: every technology the experience section names is listed.
+  return backfillSkillsFromBullets(finalDraft)
 }
 
 const getResumeContactEmail = (profile: ReturnType<typeof useAuth>['profile']) => {
@@ -738,6 +764,27 @@ const stripPlaceholderMetrics = (value: string) => {
         .trim(),
     )
     .join('\n')
+}
+
+// Records a UI edit into the candidate-authored source draft (see candidateSourceRef): only the
+// fields that changed in this edit are copied, so generated content elsewhere in the draft is
+// never promoted to "the candidate's own".
+const sameLines = (a: string[] | undefined, b: string[] | undefined) =>
+  JSON.stringify(a ?? []) === JSON.stringify(b ?? [])
+
+const mergeCandidateEdits = (source: ResumeDraft, prev: ResumeDraft, next: ResumeDraft): ResumeDraft => {
+  const merged: ResumeDraft = { ...source }
+  if (next.summary !== prev.summary) merged.summary = next.summary
+  if (!sameLines(next.skills, prev.skills)) merged.skills = next.skills
+  if (!sameLines(next.keyAchievements, prev.keyAchievements)) merged.keyAchievements = next.keyAchievements
+  if (!sameLines(next.projects, prev.projects)) merged.projects = next.projects
+  const prevById = new Map(prev.workHistory.map((item) => [item.id, item]))
+  merged.workHistory = source.workHistory.map((role) => {
+    const after = next.workHistory.find((item) => item.id === role.id)
+    const before = prevById.get(role.id)
+    return after && !sameLines(after.bullets, before?.bullets) ? { ...role, bullets: after.bullets } : role
+  })
+  return merged
 }
 
 const buildCandidateFullName = (profile: ReturnType<typeof useAuth>['profile']) =>
@@ -2207,8 +2254,19 @@ export default function ResumeBuilder() {
     setHasGenerated(false)
   }
 
+  // Candidate-authored content only, kept apart from generated output. UI edits come through
+  // updateDraft and are recorded here; generation writes with setDraft and never lands here. So a
+  // second generation (new job, new title) starts from the candidate's own material rather than
+  // from the previous resume, and generated text is never mistaken for metric evidence or for the
+  // candidate's own technology record.
+  const candidateSourceRef = useRef<ResumeDraft>(baseDraft)
+
   const updateDraft = (updater: (prev: ResumeDraft) => ResumeDraft) => {
-    setDraft((prev) => updater(prev))
+    setDraft((prev) => {
+      const next = updater(prev)
+      candidateSourceRef.current = mergeCandidateEdits(candidateSourceRef.current, prev, next)
+      return next
+    })
     setIsSaved(false)
     setIsDraftDirty(true)
     setHasGenerated(false)
@@ -2232,6 +2290,7 @@ export default function ResumeBuilder() {
 
   const handleReset = () => {
     setDraft(baseDraft)
+    candidateSourceRef.current = baseDraft
     setNotes('')
     setJobQuestions('')
     setJobAnswers('')
@@ -2382,6 +2441,7 @@ A: <answer>
   useEffect(() => {
     if (!isDraftDirty) {
       setDraft(baseDraft)
+      candidateSourceRef.current = baseDraft
     }
   }, [baseDraft, isDraftDirty])
 
@@ -2794,13 +2854,17 @@ A: <answer>
 
     const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
     const yearsOfExperience = computeExperienceYears(draft.workHistory)
+    // Evidence comes from what the candidate wrote, never from a previous generation's output.
+    const source = candidateSourceRef.current
+    const sourceBulletsFor = (id: string) =>
+      collectEvidenceLines(source.workHistory.find((entry) => entry.id === id)?.bullets)
     const payload = {
       candidateName: buildCandidateFullName(profile),
       resumeLanguage,
       // Whole years, gaps excluded and overlaps merged; null when no role has a start date.
       yearsOfExperience,
-      summary: draft.summary,
-      skills: draft.skills,
+      summary: source.summary,
+      skills: source.skills,
       workHistory: draft.workHistory.map((item) => ({
         id: item.id,
         company: item.company,
@@ -2809,14 +2873,14 @@ A: <answer>
         start: item.start,
         end: item.end,
         location: item.location,
-        // Candidate-authored bullets. These are the only trustworthy source of real metrics,
-        // so they must be sent to the model rather than dropped.
-        existingBullets: collectEvidenceLines(item.bullets),
+        // Candidate-authored bullets: the only trustworthy source of real metrics and of the
+        // candidate's own technology record.
+        existingBullets: sourceBulletsFor(item.id),
       })),
       education: draft.education,
       // Candidate-authored achievements/projects, also a source of real metrics.
-      existingKeyAchievements: collectEvidenceLines(draft.keyAchievements),
-      existingProjects: collectEvidenceLines(draft.projects),
+      existingKeyAchievements: collectEvidenceLines(source.keyAchievements),
+      existingProjects: collectEvidenceLines(source.projects),
       notes,
     }
 
@@ -2834,168 +2898,18 @@ A: <answer>
             {
               role: 'system',
               content:
-                'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkillsByCategory (object of category name -> array of skill strings), workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+                RESUME_SYSTEM_PROMPT,
             },
             {
               role: 'user',
-              content: `Using the following candidate payload and job description, generate a human-written, technically credible JSON resume. Keep workHistory IDs intact: ${JSON.stringify(
+              content: buildResumePrompt({
+                jobTitle: exactJobTitle,
+                jobDescription: notes,
+                resumeLanguage,
+                includeKeyAchievements,
+                includeProjects,
                 payload,
-              )}
-
-INSTRUCTIONS:
-0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys, and keep targetTitle exactly as entered (see 0.1).
-   - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (strict): The candidate is applying for exactly this job title: "${exactJobTitle}". The whole resume must be written for THAT title.
-   - targetTitle MUST be exactly "${exactJobTitle}" — the same words, spelling and capitalization; do not reword, translate, shorten, or "improve" it.
-   - The title decides the role; the job description adds detail. If the job description also covers areas outside the title (e.g., the title is a frontend role but the posting mentions some backend work), lead with what the title implies and treat the rest as secondary.
-   - The summary positions the candidate as a "${exactJobTitle}", and the bullets, skills order and cover letter all emphasize the work that title implies.
-   - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
-   - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${exactJobTitle}" and are supported by the payload + job description.
-   - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
-   - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
-0.2 Experience titles (required):
-   - For EVERY workHistory entry, generate a "resumeTitle".
-   - Start from the original stored title. You may sharpen a generic title toward the specialization the role genuinely had (e.g., "Software Engineer" -> "Backend Engineer" when that role's work was backend), but do not stamp the target job title onto every past role.
-   - Titles across roles should read as a believable career progression (seniority and focus can differ between roles). Never copy the job description's exact job title into a past role unless the original title already matches it.
-   - Keep resumeTitle truthful (do not inflate seniority).
-0.3 Completeness (required):
-   - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
-   - Every returned workHistory entry MUST include a non-empty resumeTitle string.
-0.4 Key Achievements + Projects (required):
-${
-  includeKeyAchievements
-    ? `   - keyAchievements MUST be a non-empty array with 5–6 items.
-   - Every keyAchievements item SHOULD include measurable impact (%, $, time, scale, latency percentiles like p95/p99, etc.), taken from the candidate's real metrics per section 0.5.`
-    : `   - keyAchievements MUST be an empty array []. The candidate has excluded this section; do not write any achievements. Any real metrics from existingKeyAchievements still belong in the role bullets where they fit.`
-}
-${
-  includeProjects
-    ? `   - projects MUST be an array with EXACTLY 3 items.
-   - Each project must be extremely relevant to the job description.
-   - Each project item must be ONE sentence and must include ALL of:
-     a) a real user story (explicitly name the user persona and goal),
-     b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
-     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).`
-    : `   - projects MUST be an empty array []. The candidate has excluded this section; do not write any projects. Any real metrics from existingProjects still belong in the role bullets where they fit.`
-}
-   - Each item must be action/outcome oriented and aligned to the target role/JD.
-   - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
-0.5 Real metrics (required, strict):
-   - The candidate's real, verifiable numbers live ONLY in these payload fields: workHistory[].existingBullets, existingKeyAchievements, existingProjects, and summary.
-   - FIRST, scan all of those fields end-to-end and extract every number you find: percentages, currency amounts, multipliers (2x), latency values (ms, p95/p99), counts, team/user/request volumes, durations, and frequencies.
-   - Reuse those extracted numbers LIBERALLY and carry each one through VERBATIM (do not round, rescale, or alter a real number). Aim to surface every extracted metric at least once somewhere in the resume.
-   - Attribute each metric to the SAME role it came from (match by workHistory id). Do not move a metric from one company to another.
-   - You MAY rewrite the wording, tense, framing, and technology emphasis around a real number to fit the target role, as long as the number and the accomplishment it belongs to stay factually intact.
-   - You MAY restate the same underlying metric in a different section (e.g., a strong number in both keyAchievements and the relevant role bullet), but do not present one metric as if it were several separate wins.
-   - NEVER invent, estimate, extrapolate, or guess a number that is not present in the payload fields above.
-   - NEVER write a literal placeholder metric such as "X%", "X percent", "[X%]", "N%", or "Y hours" in any visible output text.
-   - If the payload contains few or no numbers, that is expected and acceptable: write those bullets with concrete NON-numeric specificity instead (systems owned, scope, technologies, stakeholders, before/after behavior, qualitative outcome). Do not pad with vague filler and do not substitute a fake number.
-   - In the 'notes' field, list which sections lacked real metrics so the candidate knows exactly where to add their own numbers.
-0.6 Technology timeline (required, strict):
-   - Every workHistory entry has start and end dates. Every technology, framework, tool, cloud service, or practice named in a role's bullets MUST have been publicly available during that role's dates. Never place a technology in a role that ended before it was released (e.g., no Docker before 2013, no React before 2013, no Kubernetes or Terraform before 2014, no GitHub Actions before 2019, no LLMs, RAG or OpenAI APIs before 2020, no ChatGPT or LangChain before 2022).
-   - When the job description asks for a technology that postdates an older role, use it only in roles whose dates allow it. For the older role, describe the period-appropriate equivalent the team would actually have used (e.g., VMs, Chef, Puppet or Capistrano instead of Kubernetes; jQuery or Backbone instead of React; Jenkins instead of GitHub Actions; classic ML or NLP pipelines instead of LLMs).
-   - Technologies the candidate already names in that role's existingBullets are exempt: they are the candidate's own record.
-NATURAL TAILORING (overrides any wording below that seems to ask for more keyword density):
-The resume must read as the candidate's own account of their career that happens to fit this job — never as a rewrite of the job description. A recruiter comparing the two side by side must not be able to spot copied text.
-   - Keywords vs. phrasing: keep technology, tool, platform, certification and methodology NAMES spelled exactly as the job description spells them (ATS systems match those names). Everything else — sentences, clauses, responsibility statements, adjectives — must be in your own words.
-   - NEVER copy a run of 6 or more consecutive words from the job description into any output field. This includes responsibility lines ("design, build and maintain scalable..."), qualification lines, cultural phrases ("fast-paced environment", "cross-functional stakeholders to deliver..."), and the job description's own lists of technologies.
-   - Do not mirror the job description's structure: do not follow the order of its responsibilities, and do not list technologies in the order the job description lists them. Group and order them the way an engineer would naturally describe their own work.
-   - Write from evidence, not from the requirement: a bullet describes something the candidate did (system, problem, decision, result), and a job-description keyword appears only where it is genuinely part of that work. Never write a bullet whose only purpose is to restate a requirement.
-   - Natural density: a given technology should appear in at most 2 bullets across the whole Experience section, and not every bullet needs to name a technology. Prefer depth on the 6–10 technologies that matter most over a mention of every keyword.
-1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
-2. Use the job description to decide what to emphasize: which technologies, problems, scale and outcomes matter for this role.
-3. Extract the technologies, tools and practices the job description asks for, and classify them:
-   a. P1 (Critical): appears in the job title, the required section, or multiple times
-   b. P2 (Important): appears once or in preferred sections
-   c. P3 (Supporting): implied by responsibilities or architectural language
-4. Do not substitute one technology for another (if the job description says PostgreSQL, do not write MySQL), and keep their names exactly as spelled there.
-5. Cover every P1 technology the candidate's history can honestly support. Use P2 where it fits naturally into real work. P3 terms are optional: leave them out rather than force them.
-6. Never invent new roles, companies, job titles, or project domains.
-15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure — but only in roles whose dates allow it (see 0.6).
-16. Never invent new roles, companies, job titles, or project domains.
-17. targetTitle is the job title the candidate entered, copied exactly (see 0.1). Do not derive it from the job description's wording.
-18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. payload.yearsOfExperience is the candidate's total professional experience in whole years, already computed for you — use it exactly; never recompute it from dates and never round it up.
-   - If payload.yearsOfExperience is 1 or more, mention it once, naturally (see below).
-   - If it is 0 or null, do NOT mention any number of years, and do not mention dates, data, or how much experience is or is not known. Open with the role and the candidate's strengths instead (e.g., "Software engineer focused on building reliable web applications with React and Node.js...").
-   - Phrase the years naturally and vary the wording; never use the stock phrase "full-time professional experience". Pick whichever fits the sentence best, for example: "Backend engineer with 8 years of experience building...", "8+ years designing and shipping...", "Over 8 years in software engineering...", "Brings 8 years of hands-on experience in...", "A decade of building..." (only when the number is exactly 10), "8 years across fintech and SaaS...". Weave the role or domain into the same phrase rather than stating the years as a standalone fact.
-   - Translate this naturally in the output language; do not carry English stock phrasing into other languages.
-   - If dates look missing or odd, say so only in the 'notes' field — never in the summary.
-19. The summary must reference relevant scale, performance, architecture, and business impact in the candidate's own voice. It may name the 2–4 most important technologies, but must not reuse job-description sentences or its framing ("we are looking for", "the ideal candidate", "you will").
-20. The summary must not include company names or personal pronouns.
-21. Write every experience bullet in the past tense — including the current role ("Present"). Bullets describe work already done ("Built", "Migrated", "Led"), never ongoing duties ("Builds", "Leading", "Own").
-22. Every role gets 6–8 bullets — never fewer than 6, including older and shorter roles. Reach the count with DIFFERENT pieces of real work, not by restating or splitting another bullet: draw on the full range of what someone in that role does (features shipped, bugs and incidents fixed, migrations, performance work, tests and tooling, CI/CD, code reviews and mentoring, documentation, on-call). Each one must still meet the "Bullets (strict)" specification below.
-23. Each bullet must be one sentence only. No paragraphs.
-24. Experience bullets start with a strong past-tense action verb (for every role, including the current one) and describe what was done and why it mattered. Vary the shape so they do not read as a template: some lead with the problem, some with the result, some name technologies and some do not, and no two bullets in the same role start with the same verb.
-25. The bullets should be outcome-driven and include real metrics wherever the payload has them; where it does not, the outcome is stated concretely (what changed, for whom) rather than as a vague improvement. See "Bullets (strict)" below for the full specification.
-27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
-27.1 Derive 4–7 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods). Never create a soft-skills category. Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
-27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category by importance to the role — never reproduce the order in which the job description lists them. Mix in the candidate's own relevant skills from the payload so the section reflects their background, not just the posting.
-27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
-27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
-28. Include 18–30 skills IN TOTAL across all categories (roughly 3–6 per category), all relevant to the job description: languages, frameworks, libraries, datastores, specific cloud services, CI/CD and infrastructure tooling, testing tools, APIs/protocols/data formats, and monitoring. A short list of specific skills beats a long list padded with generic ones.
-28.1 Every skill is a specific, named thing a reviewer could ask "how did you use it?" about — name the actual tool, not the area: "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" or "Playwright" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control"; "Datadog" not "Monitoring".
-   - NEVER include soft skills or umbrella terms: communication, teamwork, leadership, mentoring, problem solving, attention to detail, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP, scalability. Named methods are fine: CI/CD, Microservices, REST, GraphQL, TDD, Agile, Scrum, Event-Driven Architecture.
-   - Each item is 1–3 words: no "Proficient in ...", no descriptions, no parentheses, no near-duplicates ("React" and "React.js").
-28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 18 skills, output fewer rather than inventing expertise the candidate does not have.
-29. Every P1 technology the candidate can honestly claim must appear in Skills, and in Experience wherever it was genuinely part of the work. P2 technologies go in Skills, and in Experience only where they fit naturally. In Experience, place each one only under a role whose dates allow it (see 0.6); if no role's dates allow it, list it in Skills only.
-30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
-31. Before final output, check two things: every supportable P1 technology is present in a logical context, and no output field contains 6 or more consecutive words copied from the job description (rephrase any that do).
-32. Provide a job match score between 95 and 99 based on how well the tailored resume aligns with the job requirements.
-
-Additional rules (apply exactly):
-
-- Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
-
-- Human voice only (strict): every visible field (summary, bullets, achievements, projects, cover letter) must read as if the candidate wrote it. Never describe your inputs or your reasoning in them: no "based on the supplied/provided dates", "recorded experience", "according to the payload", "not specified", "0 years", "unknown". Caveats and data problems belong ONLY in the 'notes' field.
-
-- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
-
-- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting. When the letter names the position, use the exact targetTitle (see 0.1), never a reworded version.
-  - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
-  - Voice: write it as the candidate would, connecting 2–3 real experiences to what the role needs. Do not walk through the job description's requirements in order, and do not quote or closely paraphrase its sentences (see NATURAL TAILORING).
-
-- Measurable impact (required):
-  - Surface EVERY real number available in the payload (see section 0.5) at least once across the resume output, and prefer placing the strongest ones in keyAchievements and in the most relevant role's bullets.
-  - Include as many genuinely measurable impact statements as the candidate's real data supports — do not cap yourself at a minimum count, and do not stop early if more real numbers remain unused.
-  - The ONLY hard limit is truthfulness: never fabricate, estimate, or placeholder a number (see section 0.5). A resume with fewer real metrics is correct; a resume with invented metrics is not.
-
-- Bullets (strict) — each bullet is one short, specific story a reviewer could ask about in an interview:
-  - Story: what situation or problem existed -> what the candidate specifically built, changed or decided -> what happened as a result. One sentence, 12–25 words. Keep it tight: no stacked "and ... and ..." clauses, no more than 3 technology names.
-  - Concrete anchors: every bullet must contain at least TWO of these:
-      a) a named thing the candidate worked on — a service, page, pipeline, job, tool, feature or flow (e.g., "the checkout service", "a nightly billing reconciliation job", "the iOS onboarding flow", "an internal deploy CLI");
-      b) a specific technical decision or method (e.g., "moved session state from Postgres to Redis", "replaced polling with webhooks", "added contract tests between the mobile app and the API");
-      c) a real number from the payload (see 0.5);
-      d) a concrete before -> after (e.g., "from a weekly manual export to an hourly automated sync");
-      e) who it was for or with, named specifically (e.g., "the support team", "three partner banks", "the data science team") — never just "stakeholders".
-  - Banned filler (never use): leveraged, utilized, spearheaded, orchestrated, robust, seamless, cutting-edge, state-of-the-art, best practices, various, synergy, "responsible for", "worked on", "helped with", "contributed to", "participated in", "to ensure", "in order to", "high-quality", "scalable solutions", "drove innovation", "cross-functional teams" used on its own, and "improved efficiency/performance/user experience" without saying what changed and how.
-  - Grounding: build each role's bullets FIRST from that role's existingBullets — make them sharper and more specific, never vaguer. Beyond that, add detail only where it plausibly follows from the role's title, company and dates. Any invented specifics must be modest and checkable (a page, a job, a migration), never a customer name, branded product, award, or number.
-  - Examples (the systems and numbers in them are illustrative only — never reuse them; real numbers come only from the payload) — generic (rejected): "Leveraged React and Node.js to build scalable solutions that improved user experience and collaborated with cross-functional teams."
-    Specific (accepted): "Rebuilt the order-history page in React with server-side pagination, cutting load time for accounts with 5k+ orders from 9s to under 2s."
-    Specific without a number (accepted): "Replaced the cron-based invoice export with a Kafka consumer, so finance saw payments within minutes instead of the next morning."
-  - Vary the bullet shape (see rule 24); a resume where every bullet follows the same "verb + task + tech list + result" template reads as machine-written.
-  - Mention technologies only when they were genuinely part of that story, and stay relevant to the job description (payload.notes) without echoing its wording (see NATURAL TAILORING).
-  - Do NOT include company names or date ranges inside bullets.
-  - Treat workHistory[].existingBullets as the candidate's own source material: preserve every real number in them verbatim (per section 0.5), and rewrite the surrounding wording to target the role rather than discarding the bullet.
-  - Prefer measurable outcomes in as many bullets as the candidate's real numbers allow, but never fabricate or placeholder a number (see section 0.5); bullets with no real number available must instead be concrete and specific in non-numeric terms.
-  - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
-
-- Skills:
-  - Output claimedSkillsByCategory as an object of category name -> array of skill strings, following rules 27–27.4. Do NOT output a flat claimedSkills array.
-  - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
-  - Follow rule 29 for where job-description technologies appear; never list them in the job description's own order.
-
-- Honesty & scope:
-  - Do NOT fabricate roles, responsibilities, metrics, ownership, or seniority beyond what the payload supports.
-  - Infer seniority conservatively from title and timeline; produce role-appropriate technical depth only when plausible.
-  - Cross-check each technology against the role's dates; only claim production use of a technology if it was widely available during the role and the payload includes supporting evidence. Otherwise describe exposure conservatively (e.g., evaluated, prototyped, supported) and record the limitation in the 'notes' field.
-
-- Formatting & validation:
-  - Ensure the returned JSON parses cleanly.
-  - Validate that bullet counts follow rule 22, every bullet has at least two concrete anchors and no banned filler, bullets are single-sentence and unique, supportable P1 technologies are present in logical contexts, and no field copies 6+ consecutive words from the job description.
-  - If any rule cannot be satisfied, still return JSON but set 'notes' to a short factual explanation of the limitation and include the jobMatchScore reflecting the constraint.
-
-If you understand, return the single JSON object now.`,
+              }),
             },
           ],
         }),
@@ -3037,7 +2951,7 @@ If you understand, return the single JSON object now.`,
         const existing = flattenClaimedSkills(Object.assign(draftParsed, refineParsedSkills(draftParsed)), sanitizeModelText)
 
         const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-        if (unique.length >= 18) {
+        if (unique.length >= 35) {
           // Keep the flat mirror in sync for the downstream repair passes.
           draftParsed.claimedSkills = unique
           return draftParsed
@@ -3052,6 +2966,10 @@ If you understand, return the single JSON object now.`,
           // provide evidence sources: profile skills + generated workHistory bullets (post-generation will include JD tech)
           payloadSkills: payload.skills ?? [],
           workHistory: payload.workHistory ?? [],
+          // The bullets just written; every technology they name must also be listed as a skill.
+          generatedBullets: Array.isArray(draftParsed?.workHistory)
+            ? draftParsed.workHistory.flatMap((w: { bullets?: unknown }) => (Array.isArray(w?.bullets) ? w.bullets : []))
+            : [],
         }
 
         const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -3071,12 +2989,12 @@ If you understand, return the single JSON object now.`,
               },
               {
                 role: 'user',
-                content: `Expand the resume skills to 18–30 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, protocol or method.
+                content: `Expand the resume skills to 35–50 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, service, library, protocol or method. Grow the list by getting MORE SPECIFIC (individual cloud services, libraries, testing tools, protocols, observability and day-to-day tools), never by adding generic terms. Every technology named in generatedBullets must be included.
 
 Rules:
 - Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
-- Use 4–7 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
-- Aim for roughly 3–6 skills per category, covering the job description's stack (languages, frameworks, datastores, cloud services, CI/CD, testing, APIs/protocols, monitoring).
+- Use 5–8 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
+- Aim for roughly 5–9 skills per category, covering the job description's stack and the candidate's (languages, frameworks, libraries, datastores, individual cloud services, containers and IaC, CI/CD, testing, APIs/protocols/auth, data formats, observability, day-to-day tools).
 - Be specific: name the actual thing, not the area. "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control".
 - Never include soft skills or umbrella terms: communication, teamwork, leadership, problem solving, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP. Named methods are fine (CI/CD, Microservices, REST, TDD, Agile, Scrum).
 - Keep each item to 1–3 words: no "Proficient in", no descriptions, no parentheses.
@@ -3106,7 +3024,7 @@ ${JSON.stringify(repairPayload)}`,
         // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
         if (next.length > unique.length) {
           draftParsed.claimedSkillsByCategory = nextCategories
-          draftParsed.claimedSkills = next.slice(0, 30)
+          draftParsed.claimedSkills = next.slice(0, 50)
         }
         return draftParsed
       }
@@ -3277,6 +3195,7 @@ ${JSON.stringify(repairPayload)}`,
       const parsedWithTitles = await polishGeneratedResume({
         draftParsed: await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed))),
         jobDescription: payload.notes,
+        jobTitle: exactJobTitle,
         roles: payload.workHistory,
         evidenceTexts: [
           ...payload.workHistory.flatMap((role) => role.existingBullets ?? []),
@@ -3323,7 +3242,8 @@ ${JSON.stringify(repairPayload)}`,
       const message = err instanceof Error ? err.message : 'Unable to generate content.'
       setError(message)
       toast.error(message)
-      updateDraft((prev) => buildMockResume(prev, profile, resumeLanguage, exactJobTitle))
+      // Fallback content is generated, not candidate-authored, so it bypasses updateDraft.
+      setDraft((prev) => buildMockResume(prev, profile, resumeLanguage, exactJobTitle))
       setHasGenerated(true)
       setIsGenerating(false)
     }
@@ -3342,13 +3262,18 @@ ${JSON.stringify(repairPayload)}`,
     const exactJobTitleInput = normalizeJobTitle(jobTitleInput)
     const notesInput = (item.jobDescription ?? '').trim()
 
+    // Roles come from the batch snapshot; evidence comes from what the candidate wrote, never
+    // from a previous generation's output (the snapshot may itself be a generated resume).
+    const source = candidateSourceRef.current
+    const sourceBulletsFor = (id: string) =>
+      collectEvidenceLines(source.workHistory.find((entry) => entry.id === id)?.bullets)
     const payload = {
       candidateName: buildCandidateFullName(profile),
       resumeLanguage,
       // Whole years, gaps excluded and overlaps merged; null when no role has a start date.
       yearsOfExperience,
-      summary: base.summary,
-      skills: base.skills,
+      summary: source.summary,
+      skills: source.skills,
       workHistory: base.workHistory.map((wh) => ({
         id: wh.id,
         company: wh.company,
@@ -3356,13 +3281,13 @@ ${JSON.stringify(repairPayload)}`,
         start: wh.start,
         end: wh.end,
         location: wh.location,
-        // Candidate-authored bullets carried from the builder draft snapshot: the only
-        // trustworthy source of real metrics for every job in the batch.
-        existingBullets: collectEvidenceLines(wh.bullets),
+        // Candidate-authored bullets: the only trustworthy source of real metrics for every job
+        // in the batch, and of the candidate's own technology record.
+        existingBullets: sourceBulletsFor(wh.id),
       })),
       education: base.education,
-      existingKeyAchievements: collectEvidenceLines(base.keyAchievements),
-      existingProjects: collectEvidenceLines(base.projects),
+      existingKeyAchievements: collectEvidenceLines(source.keyAchievements),
+      existingProjects: collectEvidenceLines(source.projects),
       notes: notesInput,
     }
 
@@ -3379,154 +3304,18 @@ ${JSON.stringify(repairPayload)}`,
           {
             role: 'system',
             content:
-              'You are an expert resume writer. Output ONLY valid JSON (no markdown or code fences). Required top-level keys: summary, targetTitle, keyAchievements, projects, claimedSkillsByCategory (object of category name -> array of skill strings), workHistory (array of { id, bullets, resumeTitle }), education (array of { id }), coverLetter, notes. All bullets MUST be authored by you (the model). Do not add extra fields.',
+              RESUME_SYSTEM_PROMPT,
           },
           {
             role: 'user',
-            content: `Using the following candidate payload and job description, generate a human-written, technically credible JSON resume. Keep workHistory IDs intact: ${JSON.stringify(
+            content: buildResumePrompt({
+              jobTitle: exactJobTitleInput,
+              jobDescription: notesInput,
+              resumeLanguage,
+              includeKeyAchievements,
+              includeProjects,
               payload,
-            )}
-
-INSTRUCTIONS:
-0. Output language: ${resumeLanguage}. Write ALL natural-language values (summary, category names, bullets, coverLetter, notes) in ${resumeLanguage}. Do not translate JSON keys, and keep targetTitle exactly as entered (see 0.1).
-   - Keep technology/product names (e.g., React, TypeScript, Kubernetes, REST, AWS) in their commonly-used forms; do not force-translate them.
-0.1 Target role focus (strict): The candidate is applying for exactly this job title: "${exactJobTitleInput}". The whole resume must be written for THAT title.
-   - targetTitle MUST be exactly "${exactJobTitleInput}" — the same words, spelling and capitalization; do not reword, translate, shorten, or "improve" it.
-   - The title decides the role; the job description adds detail. If the job description also covers areas outside the title (e.g., the title is a frontend role but the posting mentions some backend work), lead with what the title implies and treat the rest as secondary.
-   - The summary positions the candidate as a "${exactJobTitleInput}", and the bullets, skills order and cover letter all emphasize the work that title implies.
-   - Infer the role archetype from BOTH the job title and job description (e.g., data, ML, backend, frontend, mobile, DevOps/SRE, security, QA/SDET, product/PM).
-   - Create a short internal "role focus plan" and apply it: what to emphasize, what to de-emphasize, and which skills/categories to foreground for THIS role.
-   - Prioritize responsibilities, technologies, and achievements that are typical for "${exactJobTitleInput}" and are supported by the payload + job description.
-   - Avoid cross-discipline filler: do NOT emphasize unrelated areas (e.g., React/UI for a backend role, or infrastructure deep-dives for a frontend role) unless the job description explicitly requires them.
-   - Skills pruning is allowed: if the payload includes claimed skills that are not relevant to the target role/JD, omit them rather than diluting the resume focus.
-0.2 Experience titles (required):
-   - For EVERY workHistory entry, generate a "resumeTitle".
-   - Start from the original stored title. You may sharpen a generic title toward the specialization the role genuinely had (e.g., "Software Engineer" -> "Backend Engineer" when that role's work was backend), but do not stamp the target job title onto every past role.
-   - Titles across roles should read as a believable career progression (seniority and focus can differ between roles). Never copy the job description's exact job title into a past role unless the original title already matches it.
-   - Keep resumeTitle truthful (do not inflate seniority).
-0.3 Completeness (required):
-   - Your returned workHistory array MUST include an entry for EVERY id in payload.workHistory exactly once.
-   - Every returned workHistory entry MUST include a non-empty resumeTitle string.
-0.4 Key Achievements + Projects (required):
-   - keyAchievements MUST be a non-empty array with 4–6 items.
-   - projects MUST be an array with EXACTLY 3 items.
-   - Each project must be extremely relevant to the job description.
-   - Each project item must be ONE sentence and must include ALL of:
-     a) a real user story (explicitly name the user persona and goal),
-     b) the technologies used (2–5 concrete technologies/tools mentioned in the JD),
-     c) the outcome/impact (include metrics if available; if you must estimate, do NOT add "(est.)"; write it naturally).
-   - Each item must be action/outcome oriented and aligned to the target role/JD.
-   - Do NOT invent company names. If you reference systems, keep them generic (e.g., "data platform", "internal tooling", "customer-facing API").
-0.5 Real metrics (required, strict):
-   - The candidate's real, verifiable numbers live ONLY in these payload fields: workHistory[].existingBullets, existingKeyAchievements, existingProjects, and summary.
-   - FIRST, scan all of those fields end-to-end and extract every number you find: percentages, currency amounts, multipliers (2x), latency values (ms, p95/p99), counts, team/user/request volumes, durations, and frequencies.
-   - Reuse those extracted numbers LIBERALLY and carry each one through VERBATIM (do not round, rescale, or alter a real number). Aim to surface every extracted metric at least once somewhere in the resume.
-   - Attribute each metric to the SAME role it came from (match by workHistory id). Do not move a metric from one company to another.
-   - You MAY rewrite the wording, tense, framing, and technology emphasis around a real number to fit the target role, as long as the number and the accomplishment it belongs to stay factually intact.
-   - You MAY restate the same underlying metric in a different section (e.g., a strong number in both keyAchievements and the relevant role bullet), but do not present one metric as if it were several separate wins.
-   - NEVER invent, estimate, extrapolate, or guess a number that is not present in the payload fields above.
-   - NEVER write a literal placeholder metric such as "X%", "X percent", "[X%]", "N%", or "Y hours" in any visible output text.
-   - If the payload contains few or no numbers, that is expected and acceptable: write those bullets with concrete NON-numeric specificity instead (systems owned, scope, technologies, stakeholders, before/after behavior, qualitative outcome). Do not pad with vague filler and do not substitute a fake number.
-   - In the 'notes' field, list which sections lacked real metrics so the candidate knows exactly where to add their own numbers.
-0.6 Technology timeline (required, strict):
-   - Every workHistory entry has start and end dates. Every technology, framework, tool, cloud service, or practice named in a role's bullets MUST have been publicly available during that role's dates. Never place a technology in a role that ended before it was released (e.g., no Docker before 2013, no React before 2013, no Kubernetes or Terraform before 2014, no GitHub Actions before 2019, no LLMs, RAG or OpenAI APIs before 2020, no ChatGPT or LangChain before 2022).
-   - When the job description asks for a technology that postdates an older role, use it only in roles whose dates allow it. For the older role, describe the period-appropriate equivalent the team would actually have used (e.g., VMs, Chef, Puppet or Capistrano instead of Kubernetes; jQuery or Backbone instead of React; Jenkins instead of GitHub Actions; classic ML or NLP pipelines instead of LLMs).
-   - Technologies the candidate already names in that role's existingBullets are exempt: they are the candidate's own record.
-NATURAL TAILORING (overrides any wording below that seems to ask for more keyword density):
-The resume must read as the candidate's own account of their career that happens to fit this job — never as a rewrite of the job description. A recruiter comparing the two side by side must not be able to spot copied text.
-   - Keywords vs. phrasing: keep technology, tool, platform, certification and methodology NAMES spelled exactly as the job description spells them (ATS systems match those names). Everything else — sentences, clauses, responsibility statements, adjectives — must be in your own words.
-   - NEVER copy a run of 6 or more consecutive words from the job description into any output field. This includes responsibility lines ("design, build and maintain scalable..."), qualification lines, cultural phrases ("fast-paced environment", "cross-functional stakeholders to deliver..."), and the job description's own lists of technologies.
-   - Do not mirror the job description's structure: do not follow the order of its responsibilities, and do not list technologies in the order the job description lists them. Group and order them the way an engineer would naturally describe their own work.
-   - Write from evidence, not from the requirement: a bullet describes something the candidate did (system, problem, decision, result), and a job-description keyword appears only where it is genuinely part of that work. Never write a bullet whose only purpose is to restate a requirement.
-   - Natural density: a given technology should appear in at most 2 bullets across the whole Experience section, and not every bullet needs to name a technology. Prefer depth on the 6–10 technologies that matter most over a mention of every keyword.
-1. Read the entire job description (payload.notes) end-to-end before generating any resume content.
-2. Use the job description to decide what to emphasize: which technologies, problems, scale and outcomes matter for this role.
-3. Extract the technologies, tools and practices the job description asks for, and classify them:
-   a. P1 (Critical): appears in the job title, the required section, or multiple times
-   b. P2 (Important): appears once or in preferred sections
-   c. P3 (Supporting): implied by responsibilities or architectural language
-4. Do not substitute one technology for another (if the job description says PostgreSQL, do not write MySQL), and keep their names exactly as spelled there.
-5. Cover every P1 technology the candidate's history can honestly support. Use P2 where it fits naturally into real work. P3 terms are optional: leave them out rather than force them.
-6. Never invent new roles, companies, job titles, or project domains.
-15. If a job-description technology does not exist in the original resume, integrate it realistically into existing responsibilities as usage, collaboration, optimization, migration, integration, or exposure — but only in roles whose dates allow it (see 0.6).
-16. Never invent new roles, companies, job titles, or project domains.
-17. targetTitle is the job title the candidate entered, copied exactly (see 0.1). Do not derive it from the job description's wording.
-18. The Professional Summary must be 3-4 sentences, ATS-optimized, and natural. payload.yearsOfExperience is the candidate's total professional experience in whole years, already computed for you — use it exactly; never recompute it from dates and never round it up.
-   - If payload.yearsOfExperience is 1 or more, mention it once, naturally (see below).
-   - If it is 0 or null, do NOT mention any number of years, and do not mention dates, data, or how much experience is or is not known. Open with the role and the candidate's strengths instead (e.g., "Software engineer focused on building reliable web applications with React and Node.js...").
-   - Phrase the years naturally and vary the wording; never use the stock phrase "full-time professional experience". Pick whichever fits the sentence best, for example: "Backend engineer with 8 years of experience building...", "8+ years designing and shipping...", "Over 8 years in software engineering...", "Brings 8 years of hands-on experience in...", "A decade of building..." (only when the number is exactly 10), "8 years across fintech and SaaS...". Weave the role or domain into the same phrase rather than stating the years as a standalone fact.
-   - Translate this naturally in the output language; do not carry English stock phrasing into other languages.
-   - If dates look missing or odd, say so only in the 'notes' field — never in the summary.
-19. The summary must reference relevant scale, performance, architecture, and business impact in the candidate's own voice. It may name the 2–4 most important technologies, but must not reuse job-description sentences or its framing ("we are looking for", "the ideal candidate", "you will").
-20. The summary must not include company names or personal pronouns.
-21. Write every experience bullet in the past tense — including the current role ("Present"). Bullets describe work already done ("Built", "Migrated", "Led"), never ongoing duties ("Builds", "Leading", "Own").
-22. Every role gets 6–8 bullets — never fewer than 6, including older and shorter roles. Reach the count with DIFFERENT pieces of real work, not by restating or splitting another bullet: draw on the full range of what someone in that role does (features shipped, bugs and incidents fixed, migrations, performance work, tests and tooling, CI/CD, code reviews and mentoring, documentation, on-call). Each one must still meet the "Bullets (strict)" specification below.
-23. Each bullet must be one sentence only. No paragraphs.
-24. Experience bullets start with a strong past-tense action verb (for every role, including the current one) and describe what was done and why it mattered. Vary the shape so they do not read as a template: some lead with the problem, some with the result, some name technologies and some do not, and no two bullets in the same role start with the same verb.
-25. The bullets should be outcome-driven and include real metrics wherever the payload has them; where it does not, the outcome is stated concretely (what changed, for whom) rather than as a vague improvement. See "Bullets (strict)" below for the full specification.
-27. Skills MUST be grouped into categories. Output claimedSkillsByCategory as a JSON object mapping each category name to an array of skill strings, e.g. { "Languages": ["TypeScript", "Python"], "Cloud & DevOps": ["AWS", "Docker"] }. Do NOT output a flat claimedSkills array.
-27.1 Derive 4–7 category names from what the job description actually emphasizes (for example: Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods). Never create a soft-skills category. Use conventional, recruiter-familiar category names (do not copy section headings or phrases from the job description), and do not create categories the role does not care about.
-27.2 Order categories by relevance to the job description (most relevant first), and order the skills inside each category by importance to the role — never reproduce the order in which the job description lists them. Mix in the candidate's own relevant skills from the payload so the section reflects their background, not just the posting.
-27.3 Every skill must appear in exactly ONE category — no duplicates across categories. Keep each skill concise (1–3 words where possible).
-27.4 Avoid a generic "Other"/"Miscellaneous" catch-all category unless a genuinely relevant skill fits nowhere else.
-28. Include 18–30 skills IN TOTAL across all categories (roughly 3–6 per category), all relevant to the job description: languages, frameworks, libraries, datastores, specific cloud services, CI/CD and infrastructure tooling, testing tools, APIs/protocols/data formats, and monitoring. A short list of specific skills beats a long list padded with generic ones.
-28.1 Every skill is a specific, named thing a reviewer could ask "how did you use it?" about — name the actual tool, not the area: "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" or "Playwright" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control"; "Datadog" not "Monitoring".
-   - NEVER include soft skills or umbrella terms: communication, teamwork, leadership, mentoring, problem solving, attention to detail, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP, scalability. Named methods are fine: CI/CD, Microservices, REST, GraphQL, TDD, Agile, Scrum, Event-Driven Architecture.
-   - Each item is 1–3 words: no "Proficient in ...", no descriptions, no parentheses, no near-duplicates ("React" and "React.js").
-28.2 Only claim skills supported by the payload evidence or genuinely implied by the candidate's work history combined with the job description. If the evidence cannot honestly support 18 skills, output fewer rather than inventing expertise the candidate does not have.
-29. Every P1 technology the candidate can honestly claim must appear in Skills, and in Experience wherever it was genuinely part of the work. P2 technologies go in Skills, and in Experience only where they fit naturally. In Experience, place each one only under a role whose dates allow it (see 0.6); if no role's dates allow it, list it in Skills only.
-30. Dates for experience and education must be formatted as: MMM YYYY - MMM YYYY.
-31. Before final output, check two things: every supportable P1 technology is present in a logical context, and no output field contains 6 or more consecutive words copied from the job description (rephrase any that do).
-32. Provide a job match score between 95 and 99 based on how well the tailored resume aligns with the job requirements.
-
-Additional rules (apply exactly):
-
-- Return exactly one JSON object and nothing else. No markdown, no commentary, no code fences.
-
-- Human voice only (strict): every visible field (summary, bullets, achievements, projects, cover letter) must read as if the candidate wrote it. Never describe your inputs or your reasoning in them: no "based on the supplied/provided dates", "recorded experience", "according to the payload", "not specified", "0 years", "unknown". Caveats and data problems belong ONLY in the 'notes' field.
-
-- Required top-level keys: summary (string), targetTitle (string), keyAchievements (string[]), projects (string[]), claimedSkillsByCategory (object mapping category name -> string[]), workHistory (array of { id, bullets: string[], resumeTitle: string }), education (array of { id }), coverLetter (string), notes (string), jobMatchScore (number).
-
-- Cover letter requirements: The 'coverLetter' field must begin with a brief greeting (e.g., "Hello Hiring Team," or "Dear Hiring Manager,") and end with a signature line that uses the candidate's name in the form "Kind regards, [Candidate Name]" or "Sincerely, [Candidate Name]" (use payload.candidateName for the name). Do not include company names in the greeting. When the letter names the position, use the exact targetTitle (see 0.1), never a reworded version.
-  - Formatting: Use clean paragraphs with line breaks. Include a blank line after the greeting and a blank line before the signature/closing.
-  - Voice: write it as the candidate would, connecting 2–3 real experiences to what the role needs. Do not walk through the job description's requirements in order, and do not quote or closely paraphrase its sentences (see NATURAL TAILORING).
-
-- Bullets (strict) — each bullet is one short, specific story a reviewer could ask about in an interview:
-  - Story: what situation or problem existed -> what the candidate specifically built, changed or decided -> what happened as a result. One sentence, 12–25 words. Keep it tight: no stacked "and ... and ..." clauses, no more than 3 technology names.
-  - Concrete anchors: every bullet must contain at least TWO of these:
-      a) a named thing the candidate worked on — a service, page, pipeline, job, tool, feature or flow (e.g., "the checkout service", "a nightly billing reconciliation job", "the iOS onboarding flow", "an internal deploy CLI");
-      b) a specific technical decision or method (e.g., "moved session state from Postgres to Redis", "replaced polling with webhooks", "added contract tests between the mobile app and the API");
-      c) a real number from the payload (see 0.5);
-      d) a concrete before -> after (e.g., "from a weekly manual export to an hourly automated sync");
-      e) who it was for or with, named specifically (e.g., "the support team", "three partner banks", "the data science team") — never just "stakeholders".
-  - Banned filler (never use): leveraged, utilized, spearheaded, orchestrated, robust, seamless, cutting-edge, state-of-the-art, best practices, various, synergy, "responsible for", "worked on", "helped with", "contributed to", "participated in", "to ensure", "in order to", "high-quality", "scalable solutions", "drove innovation", "cross-functional teams" used on its own, and "improved efficiency/performance/user experience" without saying what changed and how.
-  - Grounding: build each role's bullets FIRST from that role's existingBullets — make them sharper and more specific, never vaguer. Beyond that, add detail only where it plausibly follows from the role's title, company and dates. Any invented specifics must be modest and checkable (a page, a job, a migration), never a customer name, branded product, award, or number.
-  - Examples (the systems and numbers in them are illustrative only — never reuse them; real numbers come only from the payload) — generic (rejected): "Leveraged React and Node.js to build scalable solutions that improved user experience and collaborated with cross-functional teams."
-    Specific (accepted): "Rebuilt the order-history page in React with server-side pagination, cutting load time for accounts with 5k+ orders from 9s to under 2s."
-    Specific without a number (accepted): "Replaced the cron-based invoice export with a Kafka consumer, so finance saw payments within minutes instead of the next morning."
-  - Vary the bullet shape (see rule 24); a resume where every bullet follows the same "verb + task + tech list + result" template reads as machine-written.
-  - Mention technologies only when they were genuinely part of that story, and stay relevant to the job description (payload.notes) without echoing its wording (see NATURAL TAILORING).
-  - Do NOT include company names or date ranges inside bullets.
-  - Treat workHistory[].existingBullets as the candidate's own source material: preserve every real number in them verbatim (per section 0.5), and rewrite the surrounding wording to target the role rather than discarding the bullet.
-  - Prefer measurable outcomes in as many bullets as the candidate's real numbers allow, but never fabricate or placeholder a number (see section 0.5); bullets with no real number available must instead be concrete and specific in non-numeric terms.
-  - Bullets must be unique across the entire resume (no duplicates or near-duplicates).
-
-- Skills:
-  - Output claimedSkillsByCategory as an object of category name -> array of skill strings, following rules 27–27.4. Do NOT output a flat claimedSkills array.
-  - Only include claimed skills supported by evidence in the payload (payload.skills, work history, education). Do NOT invent claimed skills.
-  - Follow rule 29 for where job-description technologies appear; never list them in the job description's own order.
-
-- Honesty & scope:
-  - Do NOT fabricate roles, responsibilities, metrics, ownership, or seniority beyond what the payload supports.
-  - Infer seniority conservatively from title and timeline; produce role-appropriate technical depth only when plausible.
-  - Cross-check each technology against the role's dates; only claim production use of a technology if it was widely available during the role and the payload includes supporting evidence. Otherwise describe exposure conservatively (e.g., evaluated, prototyped, supported) and record the limitation in the 'notes' field.
-
-- Formatting & validation:
-  - Ensure the returned JSON parses cleanly.
-  - Validate that bullet counts follow rule 22, every bullet has at least two concrete anchors and no banned filler, bullets are single-sentence and unique, supportable P1 technologies are present in logical contexts, and no field copies 6+ consecutive words from the job description.
-  - If any rule cannot be satisfied, still return JSON but set 'notes' to a short factual explanation of the limitation and include the jobMatchScore reflecting the constraint.
-
-If you understand, return the single JSON object now.`,
+            }),
           },
         ],
       }),
@@ -3568,7 +3357,7 @@ If you understand, return the single JSON object now.`,
       const existing = flattenClaimedSkills(Object.assign(draftParsed, refineParsedSkills(draftParsed)), sanitizeModelText)
 
       const unique = Array.from(new Set(existing.map((s: string) => s.trim()).filter(Boolean)))
-      if (unique.length >= 18) {
+      if (unique.length >= 35) {
         // Keep the flat mirror in sync for the downstream repair passes.
         draftParsed.claimedSkills = unique
         return draftParsed
@@ -3582,6 +3371,10 @@ If you understand, return the single JSON object now.`,
         existingCategories: draftParsed?.claimedSkillsByCategory ?? {},
         payloadSkills: payload.skills ?? [],
         workHistory: payload.workHistory ?? [],
+          // The bullets just written; every technology they name must also be listed as a skill.
+          generatedBullets: Array.isArray(draftParsed?.workHistory)
+            ? draftParsed.workHistory.flatMap((w: { bullets?: unknown }) => (Array.isArray(w?.bullets) ? w.bullets : []))
+            : [],
       }
 
       const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -3601,12 +3394,12 @@ If you understand, return the single JSON object now.`,
             },
             {
               role: 'user',
-              content: `Expand the resume skills to 18–30 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, protocol or method.
+              content: `Expand the resume skills to 35–50 items IN TOTAL, grouped into categories, prioritizing job-description relevance. Every item must be a specific, named technology, tool, service, library, protocol or method. Grow the list by getting MORE SPECIFIC (individual cloud services, libraries, testing tools, protocols, observability and day-to-day tools), never by adding generic terms. Every technology named in generatedBullets must be included.
 
 Rules:
 - Output claimedSkillsByCategory as an object mapping each category name to an array of skill strings.
-- Use 4–7 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
-- Aim for roughly 3–6 skills per category, covering the job description's stack (languages, frameworks, datastores, cloud services, CI/CD, testing, APIs/protocols, monitoring).
+- Use 5–8 categories derived from what the job description emphasizes (e.g. Languages, Frameworks & Libraries, Databases & Storage, Cloud & Infrastructure, DevOps & CI/CD, Testing, APIs & Protocols, Methods), using conventional category names rather than headings or phrases copied from the job description.
+- Aim for roughly 5–9 skills per category, covering the job description's stack and the candidate's (languages, frameworks, libraries, datastores, individual cloud services, containers and IaC, CI/CD, testing, APIs/protocols/auth, data formats, observability, day-to-day tools).
 - Be specific: name the actual thing, not the area. "PostgreSQL" not "Databases"; "AWS Lambda" or "S3" not "Cloud Computing"; "GitHub Actions" not "CI/CD tools"; "Jest" not "Testing"; "React" not "Frontend Development"; "Git" not "Version Control".
 - Never include soft skills or umbrella terms: communication, teamwork, leadership, problem solving, software development, web development, programming, databases, cloud computing, debugging, best practices, system design, OOP. Named methods are fine (CI/CD, Microservices, REST, TDD, Agile, Scrum).
 - Keep each item to 1–3 words: no "Proficient in", no descriptions, no parentheses.
@@ -3636,7 +3429,7 @@ ${JSON.stringify(repairPayload)}`,
       // Accept only a strictly richer list, so a weak repair never shrinks the skills section.
       if (next.length > unique.length) {
         draftParsed.claimedSkillsByCategory = nextCategories
-        draftParsed.claimedSkills = next.slice(0, 30)
+        draftParsed.claimedSkills = next.slice(0, 50)
       }
       return draftParsed
     }
@@ -3800,6 +3593,7 @@ ${JSON.stringify(repairPayload)}`,
     const parsedWithTitles = await polishGeneratedResume({
       draftParsed: await ensureProjectsAndAchievements(await ensureResumeTitles(await ensureSkills(parsed))),
       jobDescription: payload.notes,
+      jobTitle: exactJobTitleInput,
       roles: payload.workHistory,
       evidenceTexts: [
         ...payload.workHistory.flatMap((role) => role.existingBullets ?? []),

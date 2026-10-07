@@ -1,3 +1,5 @@
+import { TECH_ERAS, type TechEra, type TechGroup } from './techTimeline'
+
 // Skills-section cleanup.
 //
 // A skills section earns its space with specific, nameable things a reviewer (and an ATS) can
@@ -107,4 +109,54 @@ export const refineParsedSkills = <T extends { claimedSkillsByCategory?: unknown
     ...(categories ? { claimedSkillsByCategory: categories } : {}),
     ...(flat ? { claimedSkills: flat } : {}),
   }
+}
+
+// --- Backfill from the experience section ------------------------------------------------------
+// Every technology the bullets name belongs in the skills section too: it is specific by
+// definition, and a reviewer expects the two sections to agree. Missing ones are added to the
+// existing category that best fits their group, or to a new category named for the group.
+
+const GROUP_CATEGORY: Record<TechGroup, { label: string; fits: RegExp }> = {
+  frontend: { label: 'Frontend', fits: /front|ui\b|web|client/i },
+  tooling: { label: 'Build & Tooling', fits: /tool|build|dev ?ex/i },
+  testing: { label: 'Testing', fits: /test|quality|qa\b/i },
+  backend: { label: 'Languages & Frameworks', fits: /language|backend|back-end|server|framework|api/i },
+  infra: { label: 'DevOps & Infrastructure', fits: /devops|ci\/cd|infra|ops|container|observ|monitor|deploy/i },
+  cloud: { label: 'Cloud', fits: /cloud|aws|azure|gcp/i },
+  data: { label: 'Data', fits: /data|database|storage|stream|analytics/i },
+  ai: { label: 'AI & ML', fits: /\bai\b|\bml\b|machine|llm|intelligence/i },
+}
+
+export const MAX_SKILLS = 50
+
+export const backfillSkillsFromBullets = <T extends { claimedSkillsByCategory?: unknown; claimedSkills?: unknown; workHistory?: unknown }>(
+  draftParsed: T,
+): T => {
+  const bullets = Array.isArray(draftParsed?.workHistory)
+    ? (draftParsed.workHistory as Array<{ bullets?: unknown }>).flatMap((w) =>
+        Array.isArray(w?.bullets) ? (w.bullets as unknown[]).map((b) => String(b ?? '')) : [],
+      )
+    : []
+  if (bullets.length === 0) return draftParsed
+
+  const categories: Record<string, string[]> = refineSkillCategories(draftParsed?.claimedSkillsByCategory)
+  const listed = Object.values(categories).flat()
+  let total = listed.length
+  // A technology counts as listed if any existing skill matches its pattern ("React.js" covers React).
+  const isListed = (tech: TechEra) => listed.some((skill) => tech.pattern.test(skill))
+
+  let added = 0
+  for (const tech of TECH_ERAS) {
+    if (total >= MAX_SKILLS) break
+    if (isListed(tech) || !bullets.some((b) => tech.pattern.test(b))) continue
+    const { label, fits } = GROUP_CATEGORY[tech.group]
+    const target = Object.keys(categories).find((name) => fits.test(name)) ?? label
+    categories[target] = [...(categories[target] ?? []), tech.name]
+    listed.push(tech.name)
+    total += 1
+    added += 1
+  }
+  if (added === 0) return draftParsed
+
+  return { ...draftParsed, claimedSkillsByCategory: categories, claimedSkills: Object.values(categories).flat() }
 }
