@@ -31,17 +31,21 @@ Set these in **Vercel → Project Settings → Environment Variables**, then red
 - `VITE_SUPABASE_URL` (**required**)
 - `VITE_SUPABASE_ANON_KEY` (**required**)
 
-Optional (resume generation):
+No OpenAI variables go in Vercel: anything prefixed `VITE_` is compiled into the public JavaScript bundle, where anyone can read it.
 
-- `VITE_OPENAI_API_KEY` (warning: Vite env vars are exposed in the browser)
-- `VITE_OPENAI_MODEL`
+### Resume generation (OpenAI, server-side)
 
-### Resume generation (optional)
+All OpenAI calls go through the `openai-proxy` Supabase Edge Function, which checks that the caller is a signed-in, approved user and holds the API key as a server secret. Set the secrets and deploy the function once:
 
-Set the following environment variables to enable OpenAI-powered content:
+```powershell
+npx supabase secrets set OPENAI_API_KEY=sk-... OPENAI_MODEL=gpt-4o-mini
+npx supabase functions deploy openai-proxy
+```
 
-- `VITE_OPENAI_API_KEY`
-- `VITE_OPENAI_MODEL` (optional, defaults to `gpt-4o-mini`)
+- `OPENAI_API_KEY` (required)
+- `OPENAI_MODEL` (optional, defaults to `gpt-4o-mini`; GPT-5 / o-series models are supported — temperature is omitted for them automatically)
+
+If a key was ever set as `VITE_OPENAI_API_KEY`, treat it as leaked: revoke it in the OpenAI dashboard and create a new one for the secret above.
 
 ### Database expectations
 

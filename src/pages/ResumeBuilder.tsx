@@ -37,6 +37,7 @@ import {
 } from '../lib/bulletQuality'
 import { enforceNaturalPhrasing } from '../lib/jdEcho'
 import { enforceJdRelevance, uncoveredCoreTechnologies } from '../lib/jdRelevance'
+import { openaiChat } from '../lib/openaiProxy'
 import { buildResumePrompt, RESUME_SYSTEM_PROMPT } from '../lib/resumePrompt'
 import { backfillSkillsFromBullets, refineParsedSkills } from '../lib/skillQuality'
 import { computeExperienceYears, removeMetaCommentary } from '../lib/resumeHygiene'
@@ -230,27 +231,15 @@ const toHeadingTitleCase = (value: string) =>
 const formatSectionHeading = (label: string, preset: ResumeStylePreset) =>
   preset.headingCase === 'title' ? toHeadingTitleCase(label) : label.toUpperCase()
 
-// Newer OpenAI models (GPT-5 family and the o-series reasoning models) reject any
-// temperature other than the default of 1, so the parameter is omitted for them.
-const modelSupportsTemperature = (model: string) => !/^(?:o[1-9]|gpt-5)/i.test(model.trim())
-
-const temperatureParam = (model: string, temperature: number) =>
-  modelSupportsTemperature(model) ? { temperature } : {}
-
-// Transport for the post-generation guards (lib/jdEcho, lib/techTimeline): one JSON-mode call,
+// Transport for the post-generation guards: one JSON-mode call through the OpenAI proxy,
 // returning the parsed object or null on any failure so each guard can fall back on its own.
-const requestModelJsonFrom = (apiKey: string, model: string) => async (system: string, user: string) => {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      ...temperatureParam(model, 0.2),
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    }),
+const requestModelJson = async (system: string, user: string) => {
+  const response = await openaiChat({
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
   })
   if (!response.ok) return null
   const data = await response.json().catch(() => null)
@@ -286,10 +275,8 @@ const polishGeneratedResume = async <T extends { workHistory?: unknown }>(args: 
   evidenceTexts: string[]
   language: ResumeLanguage
   sanitize: (value: unknown) => string
-  apiKey: string
-  model: string
 }) => {
-  const requestJson = requestModelJsonFrom(args.apiKey, args.model)
+  const requestJson = requestModelJson
   const requestRewrites = async (system: string, user: string) => {
     const parsed = await requestJson(system, user)
     return Array.isArray(parsed?.rewrites) ? parsed.rewrites : null
@@ -2325,17 +2312,6 @@ export default function ResumeBuilder() {
     setIsGeneratingAnswers(true)
     setQaError(null)
 
-    const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
-    if (!apiKey) {
-      const msg = 'Missing OpenAI API key. Please add it to your environment variables.'
-      setQaError(msg)
-      toast.error(msg)
-      setIsGeneratingAnswers(false)
-      return
-    }
-
-    const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
-
     const candidateSnapshot = {
       name: buildCandidateFullName(profile),
       location: profile?.location ?? '',
@@ -2371,15 +2347,8 @@ export default function ResumeBuilder() {
     }
 
     try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          ...temperatureParam(model, 0.3),
+      const response = await openaiChat({
+          temperature: 0.3,
           messages: [
             {
               role: 'system',
@@ -2410,7 +2379,6 @@ A: <answer>
 `,
             },
           ],
-        }),
       })
 
       const data = await response.json().catch(() => null)
@@ -2843,16 +2811,6 @@ A: <answer>
     setIsGenerating(true)
     setError(null)
 
-    const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
-    if (!apiKey) {
-      const msg = 'Missing OpenAI API key. Please add it to your environment variables.'
-      setError(msg)
-      toast.error(msg)
-      setIsGenerating(false)
-      return
-    }
-
-    const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
     const yearsOfExperience = computeExperienceYears(draft.workHistory)
     // Evidence comes from what the candidate wrote, never from a previous generation's output.
     const source = candidateSourceRef.current
@@ -2885,15 +2843,8 @@ A: <answer>
     }
 
     try {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          ...temperatureParam(model, 0.4),
+      const response = await openaiChat({
+          temperature: 0.4,
           messages: [
             {
               role: 'system',
@@ -2912,7 +2863,6 @@ A: <answer>
               }),
             },
           ],
-        }),
       })
 
       const data = await response.json().catch(() => null)
@@ -2972,15 +2922,8 @@ A: <answer>
             : [],
         }
 
-        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            ...temperatureParam(model, 0.2),
+        const repairResponse = await openaiChat({
+            temperature: 0.2,
             messages: [
               {
                 role: 'system',
@@ -3009,7 +2952,6 @@ Payload:
 ${JSON.stringify(repairPayload)}`,
               },
             ],
-          }),
         })
 
         const repairData = await repairResponse.json().catch(() => null)
@@ -3059,15 +3001,8 @@ ${JSON.stringify(repairPayload)}`,
           missingIds,
         }
 
-        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            ...temperatureParam(model, 0.2),
+        const repairResponse = await openaiChat({
+            temperature: 0.2,
             messages: [
               {
                 role: 'system',
@@ -3081,7 +3016,6 @@ ${JSON.stringify(repairPayload)}`,
                 )}`,
               },
             ],
-          }),
         })
 
         const repairData = await repairResponse.json().catch(() => null)
@@ -3148,15 +3082,8 @@ ${JSON.stringify(repairPayload)}`,
           },
         }
 
-        const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            ...temperatureParam(model, 0.3),
+        const repairResponse = await openaiChat({
+            temperature: 0.3,
             messages: [
               {
                 role: 'system',
@@ -3170,7 +3097,6 @@ ${JSON.stringify(repairPayload)}`,
                 )}`,
               },
             ],
-          }),
         })
 
         const repairData = await repairResponse.json().catch(() => null)
@@ -3204,10 +3130,7 @@ ${JSON.stringify(repairPayload)}`,
           payload.summary ?? '',
         ],
         language: resumeLanguage,
-        sanitize: sanitizeModelText,
-        apiKey,
-        model,
-      })
+        sanitize: sanitizeModelText,      })
 
       const nextDraft = applyParsedToDraft(draft, {
         parsed,
@@ -3250,12 +3173,6 @@ ${JSON.stringify(repairPayload)}`,
   }
 
   const generateDraftForJobItem = async (base: ResumeDraft, item: JobListItem) => {
-    const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined
-    if (!apiKey) {
-      throw new Error('Missing OpenAI API key. Please add it to your environment variables.')
-    }
-
-    const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? 'gpt-4o-mini'
     const yearsOfExperience = computeExperienceYears(base.workHistory)
 
     const jobTitleInput = (item.jobTitle ?? '').trim()
@@ -3291,15 +3208,8 @@ ${JSON.stringify(repairPayload)}`,
       notes: notesInput,
     }
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        ...temperatureParam(model, 0.4),
+    const response = await openaiChat({
+        temperature: 0.4,
         messages: [
           {
             role: 'system',
@@ -3318,7 +3228,6 @@ ${JSON.stringify(repairPayload)}`,
             }),
           },
         ],
-      }),
     })
 
     const data = await response.json().catch(() => null)
@@ -3377,15 +3286,8 @@ ${JSON.stringify(repairPayload)}`,
             : [],
       }
 
-      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          ...temperatureParam(model, 0.2),
+      const repairResponse = await openaiChat({
+          temperature: 0.2,
           messages: [
             {
               role: 'system',
@@ -3414,7 +3316,6 @@ Payload:
 ${JSON.stringify(repairPayload)}`,
             },
           ],
-        }),
       })
 
       const repairData = await repairResponse.json().catch(() => null)
@@ -3463,15 +3364,8 @@ ${JSON.stringify(repairPayload)}`,
         missingIds,
       }
 
-      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          ...temperatureParam(model, 0.2),
+      const repairResponse = await openaiChat({
+          temperature: 0.2,
           messages: [
             {
               role: 'system',
@@ -3484,7 +3378,6 @@ ${JSON.stringify(repairPayload)}`,
               )}`,
             },
           ],
-        }),
       })
 
       const repairData = await repairResponse.json().catch(() => null)
@@ -3547,15 +3440,8 @@ ${JSON.stringify(repairPayload)}`,
         },
       }
 
-      const repairResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          ...temperatureParam(model, 0.3),
+      const repairResponse = await openaiChat({
+          temperature: 0.3,
           messages: [
             {
               role: 'system',
@@ -3568,7 +3454,6 @@ ${JSON.stringify(repairPayload)}`,
               )}`,
             },
           ],
-        }),
       })
 
       const repairData = await repairResponse.json().catch(() => null)
@@ -3602,10 +3487,7 @@ ${JSON.stringify(repairPayload)}`,
         payload.summary ?? '',
       ],
       language: resumeLanguage,
-      sanitize: sanitizeModelText,
-      apiKey,
-      model,
-    })
+      sanitize: sanitizeModelText,    })
     return applyParsedToDraft(base, { parsed, parsedWithTitles, inputJobTitle: exactJobTitleInput })
   }
 
